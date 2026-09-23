@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# DocuBot AI: local upload storage. Keep the folder, never commit uploaded files.
+storage/uploads/*
+!storage/uploads/.gitkeep
