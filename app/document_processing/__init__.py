@@ -1,8 +1,10 @@
-"""Document processing: turn an uploaded PDF, DOCX or TXT into normalized text.
+"""Document processing: turn an uploaded PDF, DOCX or TXT into normalized text,
+then split that text into chunks.
 
 Modules:
-    models.py    - data shapes (Section, ProcessedDocument, status, errors)
+    models.py    - data shapes (Section, ProcessedDocument, Chunk, status, errors)
     parsers.py   - text extraction and normalization per file type
-    database.py  - SQLite metadata and processing status
-    processor.py - the pipeline that ties them together
+    chunking.py  - the chunking algorithm and its configuration (no I/O)
+    database.py  - SQLite metadata, processing status and chunks
+    processor.py - the pipelines that tie them together
 """

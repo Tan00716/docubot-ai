@@ -1,8 +1,13 @@
-"""Run the processing pipeline for one uploaded document.
+"""Run the processing and chunking pipelines for one uploaded document.
 
+Processing:
     find record -> uploaded/failed/completed -> processing
     -> read stored file -> parse + normalize -> save JSON -> completed
     (any error after "processing" -> failed, with a safe error message)
+
+Chunking (only for "completed" documents):
+    find record -> load processed JSON -> build chunks
+    -> replace the document's chunks in SQLite (one transaction)
 
 All paths are chosen by the server. The only outside value is document_id,
 which must be 32 lower-case hex characters, so it can never contain "..",
@@ -18,13 +23,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.document_processing import database
+from app.document_processing.chunking import ChunkingConfig, build_chunks
 from app.document_processing.models import (
     AlreadyProcessingError,
+    ChunkSet,
     DocumentNotFoundError,
+    DocumentNotProcessedError,
     DocumentRecord,
     DocumentStatus,
     InvalidDocumentIdError,
     ProcessedDocument,
+    ProcessedOutputMissingError,
     ProcessingError,
     StorageError,
     StoredFileMissingError,
@@ -36,6 +45,10 @@ logger = logging.getLogger(__name__)
 
 DOCUMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 UNEXPECTED_ERROR_MESSAGE = "Unexpected error while processing the document."
+UNEXPECTED_CHUNKING_ERROR_MESSAGE = "Unexpected error while chunking the document."
+CORRUPTED_PROCESSED_MESSAGE = (
+    "The processed output for this document is corrupted. Process the document again."
+)
 
 
 @dataclass(frozen=True)
@@ -133,17 +146,32 @@ def save_processed_document(document: ProcessedDocument, processed_dir: Path) ->
 
 
 def load_processed_document(record: DocumentRecord, processed_dir: Path) -> ProcessedDocument:
-    """Read back the processed JSON of a completed document (for later stages)."""
+    """Read back the processed JSON of a completed document (for later stages).
+
+    The file is treated as untrusted: its structure is checked, and it must
+    belong to this document.
+    """
     if record.status != DocumentStatus.COMPLETED or not record.processed_path:
-        raise ProcessingError("This document has not been processed yet.")
+        raise DocumentNotProcessedError()
 
     path = safe_child_path(processed_dir, record.processed_path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return ProcessedDocument.from_dict(data)
-    except (OSError, ValueError, KeyError, TypeError) as error:
+        document = ProcessedDocument.from_dict(data)
+    except FileNotFoundError:
+        raise ProcessedOutputMissingError()
+    except OSError as error:
         logger.error("Could not load processed output: %s", type(error).__name__)
         raise StorageError("Could not load the processed document.")
+    # RecursionError: extremely deeply nested JSON.
+    except (ValueError, KeyError, TypeError, RecursionError) as error:
+        logger.error("Corrupted processed output: %s", type(error).__name__)
+        raise StorageError(CORRUPTED_PROCESSED_MESSAGE)
+
+    if document.document_id != record.document_id:
+        logger.error("Processed output of %s names another document", record.document_id)
+        raise StorageError(CORRUPTED_PROCESSED_MESSAGE)
+    return document
 
 
 # --- Pipeline -----------------------------------------------------------------
@@ -223,3 +251,42 @@ def process_document(
     if updated_record is None:
         raise StorageError("Could not read the document record.")
     return ProcessingResult(record=updated_record, document=document)
+
+
+# --- Chunking -----------------------------------------------------------------
+
+
+def chunk_document(
+    document_id: str,
+    *,
+    upload_dir: Path,
+    processed_dir: Path,
+    db_path: Path,
+    config: ChunkingConfig,
+) -> ChunkSet:
+    """Split a processed document into chunks and store them in SQLite.
+
+    Chunking again replaces the document's previous chunks (never duplicates
+    them). It does not change the document's processing status. If anything
+    fails, the previously stored chunks stay exactly as they were.
+
+    Raises a ProcessingError subclass (with a safe_message) on any failure.
+    """
+    record = find_document(document_id, upload_dir, db_path)
+    document = load_processed_document(record, processed_dir)
+
+    try:
+        chunks = build_chunks(document, config)
+        created_at = database.replace_chunks(
+            db_path, document_id, chunks, expected_updated_at=record.updated_at
+        )
+    except ProcessingError as error:
+        logger.warning("Chunking failed for document %s: %s", document_id, error.safe_message)
+        raise
+    except Exception:
+        # Full details go to the server log only, never to the API.
+        logger.exception("Unexpected error while chunking document %s", document_id)
+        raise ProcessingError(UNEXPECTED_CHUNKING_ERROR_MESSAGE)
+
+    logger.info("Chunked document %s: %d chunks", document_id, len(chunks))
+    return ChunkSet(document_id=document_id, chunks=tuple(chunks), created_at=created_at)

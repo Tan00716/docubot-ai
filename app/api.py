@@ -5,8 +5,11 @@ Endpoints:
     POST /upload                          -> validate one document and save it
     POST /documents/{document_id}/process -> extract and normalize its text
     GET  /documents/{document_id}         -> processing status and metadata
+    POST /documents/{document_id}/chunk   -> split processed text into chunks
+    GET  /documents/{document_id}/chunks  -> list the stored chunks
 
-Processing is synchronous. Documents are NOT chunked or indexed yet.
+Processing and chunking are synchronous. There are NO embeddings, no vector
+search and no RAG yet: chunks are only stored in SQLite.
 
 Run locally from the project root:
 
@@ -22,18 +25,33 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.document_processing import database
+from app.document_processing.chunking import (
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    ChunkingConfig,
+)
 from app.document_processing.models import (
     AlreadyProcessingError,
+    Chunk,
+    ChunkingConflictError,
+    ChunkSet,
     DocumentContentError,
     DocumentNotFoundError,
+    DocumentNotProcessedError,
     DocumentRecord,
+    InvalidChunkingConfigError,
     InvalidDocumentIdError,
+    ProcessedOutputMissingError,
     ProcessingError,
     StorageError,
     StoredFileMissingError,
     UnsupportedFileTypeError,
 )
-from app.document_processing.processor import find_document, process_document
+from app.document_processing.processor import (
+    chunk_document,
+    find_document,
+    process_document,
+)
 
 # --- Configuration ----------------------------------------------------------
 
@@ -100,6 +118,63 @@ class ProcessResponse(DocumentResponse):
     section_count: int
 
 
+class ChunkSummaryResponse(BaseModel):
+    """Chunking state of a document (no chunk text).
+
+    The configuration fields are null when the document has no chunks.
+    """
+
+    document_id: str
+    chunking_status: str  # "chunked" or "not_chunked"
+    chunk_count: int
+    chunking_version: int | None
+    chunk_size: int | None
+    chunk_overlap: int | None
+    chunked_at: str | None
+
+    @classmethod
+    def from_chunk_set(cls, chunk_set: ChunkSet, **extra) -> "ChunkSummaryResponse":
+        first = chunk_set.chunks[0] if chunk_set.chunks else None
+        return cls(
+            document_id=chunk_set.document_id,
+            chunking_status=chunk_set.status.value,
+            chunk_count=len(chunk_set.chunks),
+            chunking_version=first.chunking_version if first else None,
+            chunk_size=first.chunk_size if first else None,
+            chunk_overlap=first.chunk_overlap if first else None,
+            chunked_at=chunk_set.created_at,
+            **extra,
+        )
+
+
+class ChunkResponse(BaseModel):
+    """One chunk's metadata. text is null unless include_text=true was asked."""
+
+    chunk_id: str
+    chunk_index: int
+    char_count: int
+    source_locations: list[dict[str, int]]
+    text: str | None
+
+    @classmethod
+    def from_chunk(cls, chunk: Chunk, include_text: bool) -> "ChunkResponse":
+        return cls(
+            chunk_id=chunk.chunk_id,
+            chunk_index=chunk.chunk_index,
+            char_count=chunk.char_count,
+            source_locations=[dict(location) for location in chunk.source_locations],
+            text=chunk.text if include_text else None,
+        )
+
+
+class ChunkListResponse(ChunkSummaryResponse):
+    """All chunks of one document, in order."""
+
+    source_filename: str
+    file_type: str
+    chunks: list[ChunkResponse]
+
+
 app = FastAPI(title="DocuBot AI API")
 
 
@@ -125,6 +200,10 @@ PROCESSING_ERROR_STATUS = {
     UnsupportedFileTypeError: status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
     DocumentContentError: status.HTTP_422_UNPROCESSABLE_CONTENT,
     StorageError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    DocumentNotProcessedError: status.HTTP_409_CONFLICT,
+    ProcessedOutputMissingError: status.HTTP_404_NOT_FOUND,
+    InvalidChunkingConfigError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    ChunkingConflictError: status.HTTP_409_CONFLICT,
 }
 
 
@@ -274,3 +353,42 @@ def get_document(document_id: str) -> DocumentResponse:
     """Return a document's metadata and processing status."""
     record = find_document(document_id, UPLOAD_DIR, DATABASE_PATH)
     return DocumentResponse.from_record(record)
+
+
+@app.post("/documents/{document_id}/chunk")
+def chunk(
+    document_id: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> ChunkSummaryResponse:
+    """Split a processed document into chunks and store them.
+
+    Chunking again replaces the previous chunks of this document, so chunks
+    are never duplicated. Only a summary is returned, never the chunk text.
+    """
+    # Invalid settings are rejected before any storage is touched.
+    config = ChunkingConfig(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    chunk_set = chunk_document(
+        document_id,
+        upload_dir=UPLOAD_DIR,
+        processed_dir=PROCESSED_DIR,
+        db_path=DATABASE_PATH,
+        config=config,
+    )
+    return ChunkSummaryResponse.from_chunk_set(chunk_set)
+
+
+@app.get("/documents/{document_id}/chunks")
+def list_chunks(document_id: str, include_text: bool = False) -> ChunkListResponse:
+    """Return the chunks of a document: IDs, order, sizes and source locations.
+
+    Chunk text is only included when include_text=true is requested.
+    """
+    record = find_document(document_id, UPLOAD_DIR, DATABASE_PATH)
+    chunk_set = database.get_chunk_set(DATABASE_PATH, record.document_id)
+    return ChunkListResponse.from_chunk_set(
+        chunk_set,
+        source_filename=record.original_filename,
+        file_type=record.extension,
+        chunks=[ChunkResponse.from_chunk(c, include_text) for c in chunk_set.chunks],
+    )

@@ -22,6 +22,32 @@ class DocumentStatus(StrEnum):
     FAILED = "failed"
 
 
+class ChunkingStatus(StrEnum):
+    """Whether a document currently has chunks stored.
+
+    This is separate from DocumentStatus (processing). It is not stored as a
+    column: a document is "chunked" exactly when it has rows in the chunks table.
+    """
+
+    NOT_CHUNKED = "not_chunked"
+    CHUNKED = "chunked"
+
+
+def parse_source_location(data: Any) -> dict[str, int]:
+    """Check that a source location looks like {"page": 3}.
+
+    Keys must be text and values whole numbers. Anything else means the
+    stored data is corrupted, so ValueError is raised.
+    """
+    if not isinstance(data, dict) or not data:
+        raise ValueError("Invalid source location.")
+    for key, value in data.items():
+        # bool is a subclass of int in Python, so True would pass as 1.
+        if not isinstance(key, str) or not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("Invalid source location.")
+    return dict(data)
+
+
 @dataclass(frozen=True)
 class Section:
     """One piece of extracted text plus where it came from in the source file.
@@ -40,7 +66,12 @@ class Section:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Section":
-        return cls(source_location=dict(data["source_location"]), text=data["text"])
+        if not isinstance(data, dict) or not isinstance(data.get("text"), str):
+            raise ValueError("Invalid section.")
+        return cls(
+            source_location=parse_source_location(data.get("source_location")),
+            text=data["text"],
+        )
 
 
 @dataclass(frozen=True)
@@ -63,14 +94,62 @@ class ProcessedDocument:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProcessedDocument":
+        """Rebuild a document from its JSON form, rejecting anything malformed."""
+        if not isinstance(data, dict):
+            raise ValueError("Processed document must be a JSON object.")
         if data.get("schema_version") != PROCESSED_SCHEMA_VERSION:
             raise ValueError("Unsupported processed document schema version.")
+        for field in ("document_id", "source_filename", "file_type"):
+            if not isinstance(data.get(field), str):
+                raise ValueError(f"Invalid processed document field: {field}.")
+        if not isinstance(data.get("sections"), list):
+            raise ValueError("Processed document sections must be a list.")
         return cls(
             document_id=data["document_id"],
             source_filename=data["source_filename"],
             file_type=data["file_type"],
             sections=tuple(Section.from_dict(item) for item in data["sections"]),
         )
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """One chunk: a small piece of a processed document, ready for embedding.
+
+    text is exactly the string that a later stage will embed.
+
+    source_locations lists every section that contributed text, in order. Each
+    entry is that section's Batch 3 source_location plus the character range
+    used from the section's text (end is exclusive, like Python slicing):
+        {"page": 2, "char_start": 0, "char_end": 812}
+
+    chunk_id is deterministic (see chunking.make_chunk_id), never random.
+    """
+
+    chunk_id: str
+    document_id: str
+    chunk_index: int  # 0 = first chunk of the document
+    text: str
+    char_count: int
+    source_filename: str
+    file_type: str
+    source_locations: tuple[dict[str, int], ...]
+    chunking_version: int
+    chunk_size: int
+    chunk_overlap: int
+
+
+@dataclass(frozen=True)
+class ChunkSet:
+    """All chunks currently stored for one document (possibly none)."""
+
+    document_id: str
+    chunks: tuple[Chunk, ...]
+    created_at: str | None  # when these chunks were stored; None if no chunks
+
+    @property
+    def status(self) -> ChunkingStatus:
+        return ChunkingStatus.CHUNKED if self.chunks else ChunkingStatus.NOT_CHUNKED
 
 
 @dataclass(frozen=True)
@@ -138,3 +217,25 @@ class StorageError(ProcessingError):
     """SQLite or the processed-output folder could not be read or written."""
 
     safe_message = "Could not access document storage."
+
+
+class DocumentNotProcessedError(ProcessingError):
+    """A later stage (e.g. Chunking) needs a document that is "completed"."""
+
+    safe_message = "This document has not been processed yet."
+
+
+class ProcessedOutputMissingError(ProcessingError):
+    safe_message = (
+        "The processed output for this document is missing. Process the document again."
+    )
+
+
+class InvalidChunkingConfigError(ProcessingError):
+    safe_message = "Invalid chunking configuration."
+
+
+class ChunkingConflictError(ProcessingError):
+    """The document was re-processed while it was being chunked."""
+
+    safe_message = "The document changed while it was being chunked. Please try again."

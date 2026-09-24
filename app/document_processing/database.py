@@ -1,24 +1,34 @@
-"""SQLite storage for document metadata and processing status.
+"""SQLite storage for document metadata, processing status and chunks.
 
 SQLite is a small database that lives in one local file and ships with
 Python (no server, no extra package). Every function opens a short-lived
 connection, so it is safe to call from FastAPI's worker threads.
 
+Tables:
+    documents - one row per uploaded document (processing status lives here)
+    chunks    - the chunks of each document; a document is "chunked" when
+                it has rows here (chunking status is never stored separately)
+
 All SQL uses "?" placeholders. Values are never pasted into SQL strings.
 Any sqlite3 error is turned into StorageError (with a safe message).
 """
 
+import json
 import logging
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.document_processing.models import (
+    Chunk,
+    ChunkingConflictError,
+    ChunkSet,
     DocumentRecord,
     DocumentStatus,
     StorageError,
+    parse_source_location,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,7 +39,7 @@ STALE_PROCESSING_AFTER = timedelta(minutes=10)
 
 _STATUS_VALUES = ", ".join(f"'{status.value}'" for status in DocumentStatus)
 
-SCHEMA = f"""
+DOCUMENTS_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS documents (
     document_id       TEXT PRIMARY KEY,
     original_filename TEXT NOT NULL,
@@ -45,10 +55,39 @@ CREATE TABLE IF NOT EXISTS documents (
 )
 """
 
+# source_locations is a JSON list, e.g. [{"page": 2, "char_start": 0, "char_end": 812}].
+# The file name and type are not copied here; they are read from "documents".
+# UNIQUE(document_id, chunk_index) makes duplicate chunks impossible.
+CHUNKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id         TEXT PRIMARY KEY,
+    document_id      TEXT NOT NULL
+                     REFERENCES documents (document_id) ON DELETE CASCADE,
+    chunk_index      INTEGER NOT NULL CHECK (chunk_index >= 0),
+    text             TEXT NOT NULL CHECK (length(text) > 0),
+    char_count       INTEGER NOT NULL CHECK (char_count > 0),
+    source_locations TEXT NOT NULL,
+    chunking_version INTEGER NOT NULL,
+    chunk_size       INTEGER NOT NULL,
+    chunk_overlap    INTEGER NOT NULL,
+    created_at       TEXT NOT NULL,
+    UNIQUE (document_id, chunk_index)
+)
+"""
+
+SCHEMA_STATEMENTS = (DOCUMENTS_SCHEMA, CHUNKS_SCHEMA)
+
 COLUMNS = (
     "document_id, original_filename, stored_filename, extension, content_type, "
     "size_bytes, status, created_at, updated_at, processed_path, error_message"
 )
+
+CHUNK_INSERT_COLUMNS = (
+    "chunk_id, document_id, chunk_index, text, char_count, source_locations, "
+    "chunking_version, chunk_size, chunk_overlap, created_at"
+)
+
+CORRUPTED_CHUNKS_MESSAGE = "Stored chunk data is corrupted."
 
 
 def utc_now() -> str:
@@ -58,7 +97,7 @@ def utc_now() -> str:
 
 @contextmanager
 def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
-    """Open the database (creating file and table if needed) in a transaction.
+    """Open the database (creating file and tables if needed) in a transaction.
 
     The transaction is committed when the "with" block ends normally and
     rolled back if an error happens inside it.
@@ -66,8 +105,12 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(db_path)) as connection:
+            # SQLite only enforces REFERENCES (foreign keys) when this is
+            # switched on, and it must be switched on for every connection.
+            connection.execute("PRAGMA foreign_keys = ON")
             with connection:
-                connection.execute(SCHEMA)
+                for statement in SCHEMA_STATEMENTS:
+                    connection.execute(statement)
                 yield connection
     except sqlite3.Error as error:
         logger.error("SQLite error: %s", type(error).__name__)
@@ -78,7 +121,7 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def initialize(db_path: Path) -> None:
-    """Create the database file and the documents table if they do not exist."""
+    """Create the database file and its tables if they do not exist."""
     with connect(db_path):
         pass
 
@@ -141,6 +184,10 @@ def claim_for_processing(db_path: Path, document_id: str) -> bool:
     Returns False if another request is already processing it (and that
     processing is not stale). The check and the update happen in one SQL
     statement, so two requests cannot both claim the same document.
+
+    Chunks are made from the processed output, so processing a document again
+    deletes its old chunks in the same transaction. Chunks can therefore never
+    belong to an older version of the processed output.
     """
     now = datetime.now(UTC)
     stale_before = (now - STALE_PROCESSING_AFTER).isoformat(timespec="microseconds")
@@ -157,7 +204,10 @@ def claim_for_processing(db_path: Path, document_id: str) -> bool:
                 stale_before,
             ),
         )
-        return cursor.rowcount == 1
+        claimed = cursor.rowcount == 1
+        if claimed:
+            connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+        return claimed
 
 
 def mark_completed(db_path: Path, document_id: str, processed_path: str) -> None:
@@ -191,3 +241,115 @@ def _finish(
                 DocumentStatus.PROCESSING.value,
             ),
         )
+
+
+# --- Chunks -------------------------------------------------------------------
+
+
+def replace_chunks(
+    db_path: Path,
+    document_id: str,
+    chunks: Sequence[Chunk],
+    *,
+    expected_updated_at: str,
+) -> str:
+    """Store `chunks` as the complete chunk set of one document.
+
+    The document's old chunks are deleted and the new ones inserted in ONE
+    transaction: either everything is saved or, on any error, nothing changes.
+    Running it again with the same chunks produces the same rows, so chunks
+    are never duplicated (idempotent).
+
+    expected_updated_at is the document's updated_at at the moment its
+    processed output was loaded. If the document was re-processed since then,
+    the chunks may be outdated: ChunkingConflictError is raised, nothing saved.
+
+    Returns the created_at timestamp stored with the chunks.
+    """
+    if any(chunk.document_id != document_id for chunk in chunks):
+        raise ValueError("Every chunk must belong to the document being replaced.")
+
+    now = utc_now()
+    rows = [
+        (
+            chunk.chunk_id,
+            chunk.document_id,
+            chunk.chunk_index,
+            chunk.text,
+            chunk.char_count,
+            json.dumps(list(chunk.source_locations), ensure_ascii=False),
+            chunk.chunking_version,
+            chunk.chunk_size,
+            chunk.chunk_overlap,
+            now,
+        )
+        for chunk in chunks
+    ]
+    with connect(db_path) as connection:
+        # The DELETE starts the write transaction. Until it is committed, no
+        # other request can change this document (e.g. start re-processing it).
+        connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+        row = connection.execute(
+            "SELECT status, updated_at FROM documents WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        if row != (DocumentStatus.COMPLETED.value, expected_updated_at):
+            raise ChunkingConflictError()  # rolls back the DELETE as well
+        connection.executemany(
+            f"INSERT INTO chunks ({CHUNK_INSERT_COLUMNS}) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    return now
+
+
+def get_chunk_set(db_path: Path, document_id: str) -> ChunkSet:
+    """Return all chunks of a document in chunk_index order (maybe none)."""
+    with connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT c.chunk_id, c.document_id, c.chunk_index, c.text, c.char_count, "
+            "c.source_locations, c.chunking_version, c.chunk_size, c.chunk_overlap, "
+            "c.created_at, d.original_filename, d.extension "
+            "FROM chunks AS c JOIN documents AS d ON d.document_id = c.document_id "
+            "WHERE c.document_id = ? ORDER BY c.chunk_index",
+            (document_id,),
+        ).fetchall()
+
+    try:
+        chunks = tuple(_to_chunk(row) for row in rows)
+    except (ValueError, TypeError) as error:
+        logger.error("Corrupted chunk data for document %s: %s", document_id, type(error).__name__)
+        raise StorageError(CORRUPTED_CHUNKS_MESSAGE)
+
+    # Stored chunks must be numbered 0, 1, 2, ... without gaps.
+    if [chunk.chunk_index for chunk in chunks] != list(range(len(chunks))):
+        logger.error("Chunk indexes of document %s are not continuous", document_id)
+        raise StorageError(CORRUPTED_CHUNKS_MESSAGE)
+
+    created_at = rows[0][9] if rows else None
+    return ChunkSet(document_id=document_id, chunks=chunks, created_at=created_at)
+
+
+def _to_chunk(row: tuple) -> Chunk:
+    """Turn one database row into a Chunk, checking the stored JSON."""
+    text, char_count = row[3], row[4]
+    if not isinstance(text, str) or char_count != len(text):
+        raise ValueError("Invalid chunk text.")
+
+    locations = json.loads(row[5])
+    if not isinstance(locations, list) or not locations:
+        raise ValueError("Invalid chunk source locations.")
+
+    return Chunk(
+        chunk_id=row[0],
+        document_id=row[1],
+        chunk_index=row[2],
+        text=text,
+        char_count=char_count,
+        source_filename=row[10],
+        file_type=row[11],
+        source_locations=tuple(parse_source_location(item) for item in locations),
+        chunking_version=row[6],
+        chunk_size=row[7],
+        chunk_overlap=row[8],
+    )
