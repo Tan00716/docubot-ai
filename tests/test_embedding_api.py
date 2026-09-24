@@ -17,12 +17,14 @@ from unittest.mock import patch
 from app import api
 from app.embeddings import service
 from app.embeddings.config import MAX_BATCH_SIZE
-from app.embeddings.models import EmbeddingModelUnavailableError
-from fake_embeddings import FAKE_MODEL_NAME, FakeEmbeddingProvider
+from app.embeddings.config import MULTILINGUAL_E5_SMALL
+from app.embeddings.models import EmbeddingModelMismatchError, EmbeddingModelUnavailableError
+from fake_embeddings import FAKE_MODEL_NAME, FAKE_REVISION, FakeEmbeddingProvider
 from test_chunking_api import ChunkApiTestCase
 
-CONTRACT_FIELDS = {"document_id", "status", "model_name", "embedding_version", "dimension",
-                   "dtype", "normalized", "total_chunks"}
+CONTRACT_FIELDS = {"document_id", "status", "model_name", "model_revision", "embedding_version",
+                   "dimension", "max_tokens", "passage_prefix", "query_prefix", "dtype",
+                   "normalized", "total_chunks"}
 
 
 class EmbeddingApiTestCase(ChunkApiTestCase):
@@ -61,6 +63,9 @@ class EmbedEndpointTests(EmbeddingApiTestCase):
         self.assertEqual(body["model_name"], FAKE_MODEL_NAME)
         self.assertEqual((body["dimension"], body["dtype"], body["normalized"]),
                          (8, "float32", True))
+        self.assertEqual((body["model_revision"], body["embedding_version"], body["max_tokens"],
+                          body["passage_prefix"], body["query_prefix"]),
+                         (FAKE_REVISION, 2, 512, "passage: ", "query: "))
         self.assertEqual((body["total_chunks"], body["embedded_count"], body["skipped_count"],
                           body["stale_reembedded_count"]), (total, total, 0, 0))
 
@@ -126,6 +131,15 @@ class EmbedEndpointTests(EmbeddingApiTestCase):
 
         self.assert_safe_error(response, 503, EmbeddingModelUnavailableError.safe_message)
 
+    def test_model_files_that_do_not_match_the_spec_return_safe_500(self):
+        document_id = self.chunked_document()
+
+        with patch.object(self.provider, "embed_documents",
+                          side_effect=EmbeddingModelMismatchError()):
+            response = self.embed(document_id)
+
+        self.assert_safe_error(response, 500, EmbeddingModelMismatchError.safe_message)
+
     def test_unexpected_model_error_returns_generic_500(self):
         document_id = self.chunked_document()
 
@@ -187,6 +201,27 @@ class RealProviderWiringTests(unittest.TestCase):
         self.assertIs(api.get_embedding_provider(), provider, "one provider per process")
         self.assertEqual(provider.config.cache_dir, api.STORAGE_DIR / "model_cache")
         self.assertEqual(provider.contract.dimension, 384)
+
+    def test_default_provider_reports_the_e5_contract_without_loading_the_model(self):
+        api.get_embedding_provider.cache_clear()
+        self.addCleanup(api.get_embedding_provider.cache_clear)
+
+        contract = api.get_embedding_provider().contract
+
+        self.assertEqual((contract.model_name, contract.model_revision, contract.embedding_version,
+                          contract.dimension, contract.max_tokens, contract.passage_prefix,
+                          contract.query_prefix, contract.normalized),
+                         ("intfloat/multilingual-e5-small", MULTILINGUAL_E5_SMALL.revision, 2,
+                          384, 512, "passage: ", "query: ", True))
+        self.assertIsNone(api.get_embedding_provider()._model, "status needs no model")
+
+    def test_contract_response_lists_every_contract_field(self):
+        contract = FakeEmbeddingProvider().contract
+
+        fields = api.EmbeddingContractResponse.contract_fields(contract)
+
+        self.assertEqual(set(fields) | {"document_id", "status", "total_chunks"},
+                         set(api.EmbeddingContractResponse.model_fields))
 
 
 if __name__ == "__main__":

@@ -28,13 +28,14 @@ from app.embeddings import service, storage
 from app.embeddings.models import (
     EmbeddingConflictError,
     EmbeddingDimensionError,
+    EmbeddingError,
     EmbeddingState,
     InvalidEmbeddingConfigError,
     NewEmbedding,
     NoChunksError,
 )
 from app.embeddings.vectors import serialize_vector, text_sha256, to_float32
-from fake_embeddings import FakeEmbeddingProvider, fake_vector
+from fake_embeddings import FAKE_REVISION, FakeEmbeddingProvider, fake_vector
 from test_chunk_storage import ChunkingStorageTestCase
 from test_chunking import words
 
@@ -89,15 +90,39 @@ class EmbeddingStorageTests(EmbeddingTestCase):
 
         chunk = self.chunks(document_id)[0]
         stored = storage.get_embedding(self.db_path, chunk.chunk_id)
-        expected = provider.embed_query(chunk.text)
-        self.assertEqual(stored.vector, expected)
+        self.assertEqual(stored.vector, provider.passage_vector(chunk.text))
+        self.assertNotEqual(stored.vector, provider.embed_query(chunk.text),
+                            "a stored chunk is a passage, not a query")
         self.assertEqual(stored.record.model_name, provider.contract.model_name)
-        self.assertEqual(stored.record.embedding_version, 1)
+        self.assertEqual(stored.record.model_revision, FAKE_REVISION)
+        self.assertEqual(stored.record.embedding_version, 2)
         self.assertEqual(stored.record.dimension, 8)
+        self.assertEqual(stored.record.max_tokens, 512)
+        self.assertEqual(stored.record.passage_prefix, "passage: ")
         self.assertEqual(stored.record.dtype, "float32")
         self.assertTrue(stored.record.normalized)
-        self.assertEqual(stored.record.text_sha256, text_sha256(chunk.text))
         self.assertIsInstance(stored.record.created_at, str)
+
+    def test_text_hash_is_of_the_original_text_and_input_hash_of_the_model_input(self):
+        document_id = self.chunked_document()
+        self.run_embedding(document_id, FakeEmbeddingProvider())
+
+        chunk = self.chunks(document_id)[0]
+        record = storage.get_embedding(self.db_path, chunk.chunk_id).record
+        self.assertEqual(record.text_sha256, text_sha256(chunk.text))
+        self.assertEqual(record.input_sha256, text_sha256("passage: " + chunk.text))
+        self.assertNotEqual(record.text_sha256, record.input_sha256)
+
+    def test_prefix_is_never_saved_as_chunk_text(self):
+        document_id = self.chunked_document()
+        original = [c.text for c in self.chunks(document_id)]
+        provider = FakeEmbeddingProvider()
+
+        self.run_embedding(document_id, provider)
+
+        self.assertEqual([c.text for c in self.chunks(document_id)], original)
+        self.assertFalse(any(c.text.startswith("passage:") for c in self.chunks(document_id)))
+        self.assertEqual(provider.model_inputs, ["passage: " + text for text in original])
 
     def test_vector_is_stored_as_compact_float32_blob(self):
         document_id = self.chunked_document()
@@ -120,8 +145,10 @@ class EmbeddingStorageTests(EmbeddingTestCase):
         with self.assertRaises(StorageError):
             with database.connect(self.db_path) as connection:
                 connection.execute(
-                    "INSERT INTO embeddings VALUES ('no-such-chunk', 'm', 1, 1, 'float32', 1, ?,"
-                    " 0, ?, 't')", ("0" * 64, serialize_vector([1.0], 1)))
+                    "INSERT INTO embeddings (chunk_id, model_name, embedding_version, dimension,"
+                    " dtype, normalized, text_sha256, truncated, vector, created_at)"
+                    " VALUES ('no-such-chunk', 'm', 1, 1, 'float32', 1, ?, 0, ?, 't')",
+                    ("0" * 64, serialize_vector([1.0], 1)))
 
     def test_database_rejects_a_blob_of_the_wrong_size(self):
         document_id = self.chunked_document()
@@ -142,7 +169,8 @@ class EmbeddingStorageTests(EmbeddingTestCase):
     def test_saving_for_a_missing_chunk_is_rejected(self):
         document_id = self.chunked_document()
         provider = FakeEmbeddingProvider()
-        ghost = NewEmbedding("no-such-chunk", "0" * 64, provider.embed_query("x"), False)
+        ghost = NewEmbedding("no-such-chunk", "0" * 64, "0" * 64, provider.embed_query("x"),
+                             False)
 
         with self.assertRaises(EmbeddingConflictError):
             storage.save_embeddings(self.db_path, provider.contract, [ghost])
@@ -154,7 +182,8 @@ class EmbeddingStorageTests(EmbeddingTestCase):
         provider = FakeEmbeddingProvider()
         chunk = self.chunks(document_id)[0]
         outdated = NewEmbedding(chunk.chunk_id, text_sha256("older text"),
-                                provider.embed_query("older text"), False)
+                                text_sha256("passage: older text"),
+                                provider.passage_vector("older text"), False)
 
         with self.assertRaises(EmbeddingConflictError):
             storage.save_embeddings(self.db_path, provider.contract, [outdated])
@@ -163,7 +192,8 @@ class EmbeddingStorageTests(EmbeddingTestCase):
         document_id = self.chunked_document()
         provider = FakeEmbeddingProvider(dimension=8)
         chunk = self.chunks(document_id)[0]
-        short = NewEmbedding(chunk.chunk_id, text_sha256(chunk.text), (0.5, 0.5), False)
+        short = NewEmbedding(chunk.chunk_id, text_sha256(chunk.text),
+                             text_sha256("passage: " + chunk.text), (0.5, 0.5), False)
 
         with self.assertRaises(EmbeddingDimensionError):
             storage.save_embeddings(self.db_path, provider.contract, [short])
@@ -174,10 +204,12 @@ class EmbeddingStorageTests(EmbeddingTestCase):
         document_id = self.chunked_document()
         provider = FakeEmbeddingProvider()
         good, bad = self.chunks(document_id)[:2]
-        batch = [NewEmbedding(good.chunk_id, text_sha256(good.text), provider.embed_query("g"),
-                              False),
-                 NewEmbedding(bad.chunk_id, text_sha256("different"), provider.embed_query("b"),
-                              False)]
+        batch = [NewEmbedding(good.chunk_id, text_sha256(good.text),
+                              text_sha256("passage: " + good.text),
+                              provider.passage_vector(good.text), False),
+                 NewEmbedding(bad.chunk_id, text_sha256("different"),
+                              text_sha256("passage: different"),
+                              provider.passage_vector("different"), False)]
 
         with self.assertRaises(EmbeddingConflictError):
             storage.save_embeddings(self.db_path, provider.contract, batch)
@@ -194,6 +226,9 @@ class EmbeddingStorageTests(EmbeddingTestCase):
             ("UPDATE embeddings SET model_name = CAST('m' AS BLOB)", (), read_one),
             ("UPDATE embeddings SET model_name = CAST('m' AS BLOB)", (), read_all),
             ("UPDATE embeddings SET dimension = 'x'", (), read_all),
+            ("UPDATE embeddings SET max_tokens = 'x'", (), read_all),
+            ("UPDATE embeddings SET passage_prefix = CAST('p' AS BLOB)", (), read_all),
+            ("UPDATE embeddings SET input_sha256 = CAST('h' AS BLOB)", (), read_one),
         ]
         for sql, parameters, read in corruptions:
             with self.subTest(sql=sql, reader=read):
@@ -302,7 +337,8 @@ class EmbedDocumentTests(EmbeddingTestCase):
         self.assertEqual(provider.embedded_texts, ["Brand new text."])
         stored = storage.get_embedding(self.db_path, chunk.chunk_id)
         self.assertEqual(stored.record.text_sha256, text_sha256("Brand new text."))
-        self.assertEqual(stored.vector, provider.embed_query("Brand new text."))
+        self.assertEqual(stored.record.input_sha256, text_sha256("passage: Brand new text."))
+        self.assertEqual(stored.vector, provider.passage_vector("Brand new text."))
 
     def test_new_model_replaces_old_vectors_without_duplicates(self):
         document_id = self.chunked_document()
@@ -324,8 +360,12 @@ class EmbedDocumentTests(EmbeddingTestCase):
         self.run_embedding(document_id, FakeEmbeddingProvider())
         total = len(self.chunks(document_id))
 
-        for provider in [FakeEmbeddingProvider(embedding_version=2),
-                         FakeEmbeddingProvider(embedding_version=2, normalize=False)]:
+        for provider in [FakeEmbeddingProvider(embedding_version=3),
+                         FakeEmbeddingProvider(embedding_version=3, normalize=False),
+                         FakeEmbeddingProvider(embedding_version=3, normalize=False,
+                                               revision="e" * 40),
+                         FakeEmbeddingProvider(embedding_version=3, normalize=False,
+                                               revision="e" * 40, max_tokens=256)]:
             with self.subTest(contract=provider.contract):
                 summary = self.run_embedding(document_id, provider)
 
@@ -405,6 +445,17 @@ class EmbedDocumentTests(EmbeddingTestCase):
             self.run_embedding(self.processed_document(), provider)
         self.assertEqual(provider.batch_calls, [])
 
+    def test_provider_that_skips_the_passage_prefix_is_rejected(self):
+        document_id = self.chunked_document()
+        for wrong_prefix in ["", "query: ", "Passage: "]:
+            with self.subTest(prefix=wrong_prefix):
+                provider = FakeEmbeddingProvider(wrong_passage_prefix=wrong_prefix)
+
+                with self.assertRaises(EmbeddingError):
+                    self.run_embedding(document_id, provider)
+
+                self.assertEqual(self.embedding_row_count(), 0, "nothing is saved")
+
     def test_provider_returning_too_few_vectors_is_rejected(self):
         document_id = self.chunked_document()
         provider = FakeEmbeddingProvider()
@@ -421,6 +472,120 @@ class EmbedDocumentTests(EmbeddingTestCase):
         with patch.object(storage, "save_embeddings", side_effect=StorageError()):
             with self.assertRaises(StorageError):
                 self.run_embedding(document_id, FakeEmbeddingProvider())
+
+
+# The "embeddings" table exactly as Batch 5 (commit b1fd9b5) created it.
+BATCH5_EMBEDDINGS_SCHEMA = """
+CREATE TABLE embeddings (
+    chunk_id          TEXT PRIMARY KEY
+                      REFERENCES chunks (chunk_id) ON DELETE CASCADE,
+    model_name        TEXT NOT NULL,
+    embedding_version INTEGER NOT NULL,
+    dimension         INTEGER NOT NULL CHECK (dimension > 0),
+    dtype             TEXT NOT NULL CHECK (dtype = 'float32'),
+    normalized        INTEGER NOT NULL CHECK (normalized IN (0, 1)),
+    text_sha256       TEXT NOT NULL CHECK (length(text_sha256) = 64),
+    truncated         INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+    vector            BLOB NOT NULL
+                      CHECK (typeof(vector) = 'blob' AND length(vector) = dimension * 4),
+    created_at        TEXT NOT NULL
+)
+"""
+OLD_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+
+class OldModelUpgradeTests(EmbeddingTestCase):
+    """A database from Batch 5 holds vectors of the old model (contract v1)."""
+
+    def make_batch5_database(self):
+        """A chunked document whose chunks all have Batch 5 (old model) vectors."""
+        document_id = self.chunked_document()
+        chunks = self.chunks(document_id)
+        old_vector = serialize_vector(to_float32([1 / 384 ** 0.5] * 384), 384)
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            connection.execute("DROP TABLE embeddings")
+            connection.execute(BATCH5_EMBEDDINGS_SCHEMA)
+            for chunk in chunks:
+                connection.execute(
+                    "INSERT INTO embeddings VALUES (?, ?, 1, 384, 'float32', 1, ?, 1, ?, 't')",
+                    (chunk.chunk_id, OLD_MODEL, text_sha256(chunk.text), old_vector))
+        return document_id
+
+    def columns(self):
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            return {row[1] for row in connection.execute("PRAGMA table_info(embeddings)")}
+
+    def test_batch5_table_gets_the_new_columns_and_keeps_chunks(self):
+        document_id = self.make_batch5_database()
+        chunks_before = self.chunks(document_id)  # this connect() runs the upgrade
+        fresh_path = self.db_path.with_name("fresh.sqlite3")
+        database.initialize(fresh_path)
+        with closing(sqlite3.connect(fresh_path)) as connection:
+            fresh_columns = {row[1] for row in connection.execute("PRAGMA table_info(embeddings)")}
+
+        self.assertEqual(self.columns(), fresh_columns)
+        self.assertTrue(set(database.EMBEDDING_CONTRACT_COLUMNS) <= self.columns())
+        self.assertEqual(self.chunks(document_id), chunks_before, "chunk IDs and text unchanged")
+        self.assertEqual(self.embedding_row_count(), len(chunks_before), "nothing deleted")
+
+    def test_upgrade_is_safe_to_repeat(self):
+        self.make_batch5_database()
+
+        for _ in range(3):
+            database.initialize(self.db_path)
+
+        self.assertTrue(set(database.EMBEDDING_CONTRACT_COLUMNS) <= self.columns())
+
+    def test_old_model_vectors_are_stale_and_never_counted_as_valid(self):
+        document_id = self.make_batch5_database()
+        provider = FakeEmbeddingProvider()
+
+        result = self.status(document_id, provider)
+
+        total = len(self.chunks(document_id))
+        self.assertEqual((result.embedded_chunks, result.stale_embeddings,
+                          result.missing_embeddings, result.truncated_chunks), (0, total, 0, 0))
+        self.assertEqual(result.state, EmbeddingState.INCOMPLETE)
+
+    def test_embedding_again_replaces_every_old_vector(self):
+        document_id = self.make_batch5_database()
+        provider = FakeEmbeddingProvider()
+        chunk_ids = [c.chunk_id for c in self.chunks(document_id)]
+
+        summary = self.run_embedding(document_id, provider)
+
+        self.assertEqual(summary.stale_reembedded_count, len(chunk_ids))
+        self.assertEqual(self.status(document_id, provider).state, EmbeddingState.COMPLETE)
+        records = storage.get_embedding_records(self.db_path, document_id)
+        self.assertEqual(sorted(records), sorted(chunk_ids), "same chunk IDs, one row each")
+        self.assertEqual({(r.model_name, r.embedding_version, r.passage_prefix)
+                          for r in records.values()},
+                         {(provider.contract.model_name, 2, "passage: ")})
+        self.assertEqual([c.chunk_id for c in self.chunks(document_id)], chunk_ids)
+
+    def test_half_migrated_document_never_mixes_the_two_models(self):
+        document_id = self.chunked_document()
+        old = FakeEmbeddingProvider(model_name="fake/old-model", embedding_version=1)
+        new = FakeEmbeddingProvider()
+        self.run_embedding(document_id, old)
+        real_embed = new.embed_documents
+        calls = {"count": 0}
+
+        def stop_after_first_batch(texts):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise RuntimeError("simulated crash")
+            return real_embed(texts)
+
+        with patch.object(new, "embed_documents", side_effect=stop_after_first_batch):
+            with self.assertRaises(ProcessingError):
+                self.run_embedding(document_id, new, batch_size=3)
+
+        total = len(self.chunks(document_id))
+        new_status, old_status = self.status(document_id, new), self.status(document_id, old)
+        self.assertEqual((new_status.embedded_chunks, new_status.stale_embeddings), (3, total - 3))
+        self.assertEqual((old_status.embedded_chunks, old_status.stale_embeddings), (total - 3, 3))
+        self.assertEqual(new_status.state, EmbeddingState.INCOMPLETE)
 
 
 class EmbeddingStatusTests(EmbeddingTestCase):

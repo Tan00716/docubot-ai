@@ -19,6 +19,7 @@ Run locally from the project root:
 """
 
 import uuid
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
@@ -61,6 +62,7 @@ from app.embeddings.models import (
     EmbeddingContract,
     EmbeddingDimensionError,
     EmbeddingError,
+    EmbeddingModelMismatchError,
     EmbeddingModelUnavailableError,
     InvalidEmbeddingConfigError,
     NoChunksError,
@@ -193,26 +195,30 @@ class ChunkListResponse(ChunkSummaryResponse):
 
 
 class EmbeddingContractResponse(BaseModel):
-    """Which model produced (or would produce) the vectors. Never the vectors."""
+    """Which contract produced (or would produce) the vectors. Never the vectors.
+
+    The prefixes are shown so a reader knows what the model really reads:
+    "passage: " + chunk text for documents, "query: " + question for searches.
+    """
 
     document_id: str
     status: str  # "complete", "incomplete" or "no_chunks"
     model_name: str
+    model_revision: str  # exact Hugging Face commit of the model files
     embedding_version: int
     dimension: int
+    max_tokens: int  # the model reads at most this many tokens per chunk
+    passage_prefix: str
+    query_prefix: str
     dtype: str
     normalized: bool
     total_chunks: int
 
     @staticmethod
     def contract_fields(contract: EmbeddingContract) -> dict:
-        return {
-            "model_name": contract.model_name,
-            "embedding_version": contract.embedding_version,
-            "dimension": contract.dimension,
-            "dtype": contract.dtype,
-            "normalized": contract.normalized,
-        }
+        # Every contract field, so the response can never silently lag behind
+        # the contract (a test checks that the field sets match).
+        return asdict(contract)
 
 
 class EmbedResponse(EmbeddingContractResponse):
@@ -265,6 +271,7 @@ PROCESSING_ERROR_STATUS = {
     NoChunksError: status.HTTP_409_CONFLICT,
     EmbeddingConflictError: status.HTTP_409_CONFLICT,
     EmbeddingModelUnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
+    EmbeddingModelMismatchError: status.HTTP_500_INTERNAL_SERVER_ERROR,
     UnsupportedEmbeddingModelError: status.HTTP_500_INTERNAL_SERVER_ERROR,
     EmbeddingError: status.HTTP_500_INTERNAL_SERVER_ERROR,
     EmbeddingDimensionError: status.HTTP_500_INTERNAL_SERVER_ERROR,

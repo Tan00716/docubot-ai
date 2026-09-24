@@ -1,35 +1,66 @@
 """The local embedding model (FastEmbed + ONNX Runtime on the CPU).
 
-This is the ONLY module that imports fastembed. Everything outside it works
-with plain Python tuples of floats, so the model can be replaced later
-without touching storage or the API.
+This is the ONLY module that imports fastembed or huggingface_hub.
+Everything outside it works with plain Python tuples of floats, so the model
+can be replaced later without touching storage or the API.
 
 Lifecycle: creating a FastEmbedProvider is cheap. The model is loaded the
 first time text is embedded, then reused for every later call (never once
-per chunk). On the very first load FastEmbed downloads the model files into
-config.cache_dir; after that, loading uses only the local files. Embedding
-itself always runs locally: no hosted API is called.
+per chunk). On the very first load the model files of the pinned revision
+are downloaded into config.cache_dir; after that, loading uses only the
+local files. Embedding itself always runs locally: no hosted API is called.
+
+Input contract (E5 models): the model must be told what kind of text it is
+reading. Document chunks are embedded as "passage: <text>" and questions as
+"query: <text>". The prefix is added here, at embedding time only.
 """
 
+import json
 import logging
 import threading
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Protocol
 
 from fastembed import TextEmbedding
+from fastembed.common.model_description import ModelSource, PoolingType
+from huggingface_hub import snapshot_download
 
-from app.embeddings.config import VECTOR_DTYPE, EmbeddingConfig
+from app.embeddings.config import (
+    VECTOR_DTYPE,
+    EmbeddingConfig,
+    EmbeddingModelSpec,
+    get_model_spec,
+)
 from app.embeddings.models import (
     EmbeddedText,
     EmbeddingContract,
     EmbeddingDimensionError,
     EmbeddingError,
+    EmbeddingModelMismatchError,
     EmbeddingModelUnavailableError,
     UnsupportedEmbeddingModelError,
 )
-from app.embeddings.vectors import l2_normalize, to_float32
+from app.embeddings.vectors import l2_normalize, text_sha256, to_float32
 
 logger = logging.getLogger(__name__)
+
+# The only files downloaded for a model: its tokenizer, its configuration and
+# the ONNX weights. No Python code and no pickle files are ever fetched.
+TOKENIZER_AND_CONFIG_FILES = (
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+)
+
+POOLING_TYPES = {"mean": PoolingType.MEAN}
+
+# Models that this process has registered with FastEmbed, with the spec used
+# (see _register_model). FastEmbed cannot re-register a name, so a changed
+# spec for the same name must fail loudly instead of silently using the old one.
+_registered_models: dict[str, EmbeddingModelSpec] = {}
+_registration_lock = threading.Lock()
 
 
 class EmbeddingProvider(Protocol):
@@ -43,16 +74,101 @@ class EmbeddingProvider(Protocol):
     def embed_query(self, text: str) -> tuple[float, ...]: ...
 
 
-def model_dimension(model_name: str) -> int:
-    """Look up the vector size of a model in FastEmbed's list (no download).
+def build_contract(config: EmbeddingConfig) -> EmbeddingContract:
+    """The contract for a config (no download). Unknown models are rejected."""
+    spec = get_model_spec(config.model_name)
+    return EmbeddingContract(
+        model_name=spec.name,
+        model_revision=spec.revision,
+        embedding_version=config.embedding_version,
+        dimension=spec.dimension,
+        max_tokens=spec.max_tokens,
+        passage_prefix=spec.passage_prefix,
+        query_prefix=spec.query_prefix,
+        dtype=VECTOR_DTYPE,
+        normalized=config.normalize_embeddings,
+    )
 
-    Only models on FastEmbed's own supported list can be used, so a model
-    name can never point at arbitrary files or code.
+
+def model_files(spec: EmbeddingModelSpec) -> list[str]:
+    return [*TOKENIZER_AND_CONFIG_FILES, spec.model_file]
+
+
+def download_model_files(spec: EmbeddingModelSpec, cache_dir: Path) -> Path:
+    """Folder with the model files of exactly spec.revision (downloaded once).
+
+    The local copy is used whenever it is complete, so no network is needed
+    after the first run. huggingface_hub keeps the files in cache_dir under
+    models--<org>--<name>/snapshots/<revision>/.
     """
-    for description in TextEmbedding.list_supported_models():
-        if description["model"] == model_name:
-            return int(description["dim"])
-    raise UnsupportedEmbeddingModelError()
+    options: dict[str, Any] = {
+        "repo_id": spec.name,
+        "revision": spec.revision,
+        "allow_patterns": model_files(spec),
+        "cache_dir": str(cache_dir),
+    }
+    try:
+        folder = Path(snapshot_download(**options, local_files_only=True))
+        if all((folder / name).is_file() for name in model_files(spec)):
+            return folder
+    except Exception:  # not in the cache yet
+        pass
+    return Path(snapshot_download(**options))
+
+
+def _register_model(spec: EmbeddingModelSpec) -> None:
+    """Tell FastEmbed how to run a model that is not on its built-in list.
+
+    Uses FastEmbed's documented TextEmbedding.add_custom_model(). FastEmbed's
+    own normalization is switched off: DocuBot normalizes in _finish(), so the
+    contract's "normalized" field is always the truth.
+    """
+    with _registration_lock:
+        registered = _registered_models.get(spec.name)
+        if registered == spec:
+            return
+        if registered is not None:
+            logger.error("%s was registered with another spec; restart the process", spec.name)
+            raise UnsupportedEmbeddingModelError()
+        built_in = {d["model"].lower() for d in TextEmbedding.list_supported_models()}
+        if spec.name.lower() in built_in:
+            # FastEmbed would use its own settings and silently ignore ours.
+            logger.error("FastEmbed already defines %s; refusing to guess its settings", spec.name)
+            raise UnsupportedEmbeddingModelError()
+        TextEmbedding.add_custom_model(
+            model=spec.name,
+            pooling=POOLING_TYPES[spec.pooling],
+            normalization=False,
+            sources=ModelSource(hf=spec.name),
+            dim=spec.dimension,
+            model_file=spec.model_file,
+            license=spec.license,
+        )
+        _registered_models[spec.name] = spec
+
+
+def check_model_metadata(model: Any, model_dir: Path, spec: EmbeddingModelSpec) -> None:
+    """Refuse model files whose real settings differ from the spec.
+
+    Checks the vector size in config.json and the token limit that the
+    loaded tokenizer really applies. (FastEmbed exposes its tokenizer as
+    model.model.tokenizer; the version is pinned in requirements.txt.)
+    """
+    try:
+        config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+        hidden_size = config.get("hidden_size")
+        truncation = model.model.tokenizer.truncation or {}
+        max_tokens = truncation.get("max_length")
+    except (OSError, ValueError, AttributeError) as error:
+        logger.error("Could not read the embedding model metadata: %s", type(error).__name__)
+        raise EmbeddingModelMismatchError()
+    if hidden_size != spec.dimension or max_tokens != spec.max_tokens:
+        logger.error(
+            "Model files of %s do not match the spec: dimension %r (expected %d), "
+            "max tokens %r (expected %d)",
+            spec.name, hidden_size, spec.dimension, max_tokens, spec.max_tokens,
+        )
+        raise EmbeddingModelMismatchError()
 
 
 def _check_texts(texts: Sequence[str]) -> None:
@@ -66,60 +182,67 @@ class FastEmbedProvider:
 
     def __init__(self, config: EmbeddingConfig):
         self.config = config
-        self.contract = EmbeddingContract(
-            model_name=config.model_name,
-            embedding_version=config.embedding_version,
-            dimension=model_dimension(config.model_name),
-            dtype=VECTOR_DTYPE,
-            normalized=config.normalize_embeddings,
-        )
+        self.spec = get_model_spec(config.model_name)
+        self.contract = build_contract(config)
         self._model: TextEmbedding | None = None
         self._load_lock = threading.Lock()  # two requests must not load it twice
 
     def _get_model(self) -> TextEmbedding:
         with self._load_lock:
             if self._model is None:
-                try:
-                    self._model = TextEmbedding(
-                        model_name=self.config.model_name,
-                        cache_dir=str(self.config.cache_dir),
-                    )
-                except Exception as error:  # download or model file problems
-                    logger.error("Could not load the embedding model: %s", type(error).__name__)
-                    raise EmbeddingModelUnavailableError()
-                logger.info("Loaded embedding model %s", self.config.model_name)
+                self._model = self._load_model()
             return self._model
 
+    def _load_model(self) -> TextEmbedding:
+        _register_model(self.spec)
+        try:
+            model_dir = download_model_files(self.spec, self.config.cache_dir)
+            model = TextEmbedding(
+                model_name=self.spec.name,
+                cache_dir=str(self.config.cache_dir),
+                specific_model_path=str(model_dir),
+                providers=["CPUExecutionProvider"],
+            )
+        except Exception as error:  # download or model file problems
+            logger.error("Could not load the embedding model: %s", type(error).__name__)
+            raise EmbeddingModelUnavailableError()
+        check_model_metadata(model, model_dir, self.spec)
+        logger.info("Loaded embedding model %s@%s", self.spec.name, self.spec.revision[:12])
+        return model
+
     def embed_documents(self, texts: Sequence[str]) -> list[EmbeddedText]:
-        """Embed several texts in one model call (they are one batch)."""
+        """Embed document chunks ("passage: " + text) in one model call."""
         texts = list(texts)
         if not texts:
             return []
         _check_texts(texts)
+        inputs = [self.contract.passage_input(text) for text in texts]
         model = self._get_model()
         try:
-            raw_vectors = [array.tolist() for array in model.embed(texts, batch_size=len(texts))]
-            truncated = [_is_truncated(model, text) for text in texts]
+            raw_vectors = [array.tolist() for array in model.embed(inputs, batch_size=len(inputs))]
+            truncated = [_is_truncated(model, model_input) for model_input in inputs]
         except Exception as error:
             logger.error("Embedding model failed: %s", type(error).__name__)
             raise EmbeddingError()
-        if len(raw_vectors) != len(texts):
+        if len(raw_vectors) != len(inputs):
             raise EmbeddingError()
         return [
-            EmbeddedText(vector=self._finish(values), truncated=flag)
-            for values, flag in zip(raw_vectors, truncated)
+            EmbeddedText(vector=self._finish(values), truncated=flag,
+                         input_sha256=text_sha256(model_input))
+            for values, flag, model_input in zip(raw_vectors, truncated, inputs)
         ]
 
     def embed_query(self, text: str) -> tuple[float, ...]:
-        """Embed a (future) search question with the SAME model and contract.
+        """Embed a (future) search question ("query: " + text), same model and contract.
 
-        For the default model FastEmbed adds no query prefix, so a query and a
-        document with the same text get the same vector.
+        model.embed() is used for both kinds of text, so the only prefix is
+        the one added here (FastEmbed adds none for custom models).
         """
         _check_texts([text])
         model = self._get_model()
         try:
-            values = next(iter(model.query_embed(text))).tolist()
+            values = next(iter(model.embed([self.contract.query_input(text)], batch_size=1)))
+            values = values.tolist()
         except Exception as error:
             logger.error("Embedding model failed: %s", type(error).__name__)
             raise EmbeddingError()
@@ -137,13 +260,11 @@ class FastEmbedProvider:
             raise EmbeddingError()
 
 
-def _is_truncated(model: Any, text: str) -> bool:
-    """Whether the model cut the text because it has too many tokens.
+def _is_truncated(model: Any, model_input: str) -> bool:
+    """Whether the model cut the input because it has too many tokens.
 
-    The default model reads at most 128 tokens (about 500 English characters
-    or 250 Chinese characters); anything after that does not affect the
-    vector. FastEmbed's tokenizer reports the cut-off part as "overflowing".
-    (FastEmbed exposes its tokenizer as model.model.tokenizer; the version
-    is pinned in requirements.txt.)
+    multilingual-e5-small reads at most 512 tokens (prefix included);
+    anything after that does not affect the vector. FastEmbed's tokenizer
+    reports the cut-off part as "overflowing".
     """
-    return bool(model.model.tokenizer.encode(text).overflowing)
+    return bool(model.model.tokenizer.encode(model_input).overflowing)

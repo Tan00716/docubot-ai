@@ -76,11 +76,28 @@ CREATE TABLE IF NOT EXISTS chunks (
 )
 """
 
+# Embedding-contract columns added in Batch 5A (embedding version 2). A
+# database created by Batch 5 gets them with ALTER TABLE (see
+# _add_missing_embedding_columns). Its old rows keep these defaults, which
+# never match a real contract, so they are reported as stale and replaced
+# the next time the document is embedded. Chunk text is never touched.
+EMBEDDING_CONTRACT_COLUMNS = {
+    "model_revision": "TEXT NOT NULL DEFAULT ''",  # Hugging Face commit of the model files
+    "max_tokens": "INTEGER NOT NULL DEFAULT 0",  # the model's token limit
+    "passage_prefix": "TEXT NOT NULL DEFAULT ''",  # added before the chunk text, e.g. "passage: "
+    "input_sha256": "TEXT NOT NULL DEFAULT ''",  # SHA-256 of passage_prefix + chunk text
+}
+
+_CONTRACT_COLUMNS_SQL = "".join(
+    f",\n    {name} {definition}" for name, definition in EMBEDDING_CONTRACT_COLUMNS.items()
+)
+
 # One active embedding per chunk (chunk_id is the primary key). vector is a
 # float32 BLOB: dimension * 4 bytes. Deleting a chunk (re-chunking or
 # re-processing) deletes its embedding too (ON DELETE CASCADE), so a vector
-# can never outlive the text it was made from. Queries: app/embeddings/storage.py.
-EMBEDDINGS_SCHEMA = """
+# can never outlive the text it was made from. text_sha256 is the hash of the
+# ORIGINAL chunk text (no prefix). Queries: app/embeddings/storage.py.
+EMBEDDINGS_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS embeddings (
     chunk_id          TEXT PRIMARY KEY
                       REFERENCES chunks (chunk_id) ON DELETE CASCADE,
@@ -93,7 +110,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
     truncated         INTEGER NOT NULL CHECK (truncated IN (0, 1)),
     vector            BLOB NOT NULL
                       CHECK (typeof(vector) = 'blob' AND length(vector) = dimension * 4),
-    created_at        TEXT NOT NULL
+    created_at        TEXT NOT NULL{_CONTRACT_COLUMNS_SQL}
 )
 """
 
@@ -110,6 +127,19 @@ CHUNK_INSERT_COLUMNS = (
 )
 
 CORRUPTED_CHUNKS_MESSAGE = "Stored chunk data is corrupted."
+
+
+def _add_missing_embedding_columns(connection: sqlite3.Connection) -> None:
+    """Upgrade an older "embeddings" table in place (safe to run every time).
+
+    Column names and definitions come only from EMBEDDING_CONTRACT_COLUMNS
+    above, never from outside input, so building this SQL is safe.
+    """
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(embeddings)")}
+    for name, definition in EMBEDDING_CONTRACT_COLUMNS.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE embeddings ADD COLUMN {name} {definition}")
+            logger.info("Added column embeddings.%s", name)
 
 
 def utc_now() -> str:
@@ -133,6 +163,7 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
             with connection:
                 for statement in SCHEMA_STATEMENTS:
                     connection.execute(statement)
+                _add_missing_embedding_columns(connection)
                 yield connection
     except sqlite3.Error as error:
         logger.error("SQLite error: %s", type(error).__name__)

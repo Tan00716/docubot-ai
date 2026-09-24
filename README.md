@@ -32,9 +32,10 @@ Production-oriented RAG Telegram knowledge assistant
 
 **Local embeddings** ([app/embeddings/](app/embeddings/))
 
-- Model `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` via FastEmbed, CPU only
-- 384-dimensional, normalized float32 vectors stored in SQLite
-- Stale-vector detection (model, version, text hash); re-running is idempotent
+- Model `intfloat/multilingual-e5-small` (pinned revision) via FastEmbed, CPU only
+- E5 input contract: chunks are embedded as `passage: <text>`, questions as `query: <text>`
+- 384-dimensional, normalized float32 vectors stored in SQLite, up to 512 tokens per chunk
+- Stale-vector detection (full embedding contract + text hash); re-running is idempotent
 
 The Telegram bot and the web API are two **separate programs**. They are not
 connected to each other yet.
@@ -239,7 +240,7 @@ Embeds a chunked document's chunks with the local model (see
 embedded, so calling it again is cheap and never creates duplicates. Optional
 query parameter `batch_size` (1 to 64, default 16). The first call after the
 server starts loads the model (a few seconds); the very first call on a new
-computer also downloads it once (~240 MB).
+computer also downloads it once (~490 MB).
 
 Success — `200 OK` (vectors are never returned):
 
@@ -247,9 +248,13 @@ Success — `200 OK` (vectors are never returned):
 {
   "document_id": "8adc0251f64d4cf983e29ce470705707",
   "status": "complete",
-  "model_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-  "embedding_version": 1,
+  "model_name": "intfloat/multilingual-e5-small",
+  "model_revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+  "embedding_version": 2,
   "dimension": 384,
+  "max_tokens": 512,
+  "passage_prefix": "passage: ",
+  "query_prefix": "query: ",
   "dtype": "float32",
   "normalized": true,
   "total_chunks": 5,
@@ -272,7 +277,7 @@ Errors return `{"detail": "..."}`:
 | `409 Conflict` | Not processed yet, not chunked yet, or re-chunked/re-processed while being embedded |
 | `422 Unprocessable Content` | Invalid `batch_size` |
 | `503 Service Unavailable` | The model could not be loaded (e.g. no internet on the very first download) |
-| `500 Internal Server Error` | The model failed, stored data is corrupted, the database could not be written, or an unexpected error happened (no internal details are returned) |
+| `500 Internal Server Error` | The model failed, the model files do not match the expected model configuration, stored data is corrupted, the database could not be written, or an unexpected error happened (no internal details are returned) |
 
 ### `GET /documents/{document_id}/embeddings`
 
@@ -283,21 +288,27 @@ loading the model and without returning vectors:
 {
   "document_id": "8adc0251f64d4cf983e29ce470705707",
   "status": "incomplete",
-  "model_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-  "embedding_version": 1,
+  "model_name": "intfloat/multilingual-e5-small",
+  "model_revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+  "embedding_version": 2,
   "dimension": 384,
+  "max_tokens": 512,
+  "passage_prefix": "passage: ",
+  "query_prefix": "query: ",
   "dtype": "float32",
   "normalized": true,
   "total_chunks": 5,
   "embedded_chunks": 3,
   "missing_embeddings": 1,
   "stale_embeddings": 1,
-  "truncated_chunks": 3
+  "truncated_chunks": 0
 }
 ```
 
 `status` is `complete` (every chunk has a valid embedding), `incomplete`, or
-`no_chunks` (the document is not chunked). `truncated_chunks` counts valid
+`no_chunks` (the document is not chunked). `stale_embeddings` counts stored
+vectors made under another contract (e.g. the old Batch 5 model) or from older
+chunk text; they are never counted as valid. `truncated_chunks` counts valid
 embeddings whose chunk was longer than the model can read (see
 [Limitations](#embedding-limitations)). It returns `400` for an invalid ID and
 `404` for an unknown document.
@@ -482,10 +493,12 @@ the stored chunk text stays within a few times the document size, and
 chunking time grows linearly with the document length.
 
 **Limitation:** characters are **not** tokens. Embedding models measure input
-in tokens; 1200 characters of English is very roughly 270 tokens, and 1200
-Chinese characters roughly 550 tokens. The current embedding model reads only
-the first **128 tokens** of each chunk, so with the default size most chunks
-are only partly embedded (see [Embedding limitations](#embedding-limitations)).
+in tokens. Measured with the current model's tokenizer: English ≈ 0.30 tokens
+per character (1200 characters ≈ 360 tokens), mixed Chinese/English ≈ 0.41
+(≈ 490 tokens), Chinese ≈ 0.64–0.69 (≈ 770–820 tokens). The model reads at most
+**512 tokens**, so English and mixed chunks of the default size fit, but a full
+1200-character **Chinese** chunk does not (see
+[Embedding limitations](#embedding-limitations)).
 
 ### Source metadata
 
@@ -575,18 +588,18 @@ the closest meaning. This batch only **creates and stores** the vectors.
 ```
 Chunks (SQLite, chunk_index order)
 → POST /documents/{id}/embed
-→ SHA-256 of each chunk's text; compare with stored embeddings
-→ Only missing or stale chunks → local model (CPU), 16 chunks per batch
+→ Compare each chunk's text hash and the current contract with stored embeddings
+→ Only missing or stale chunks → "passage: " + chunk text → local model (CPU), 16 per batch
 → Normalize to length 1, round to float32
-→ Save each batch in one short SQLite transaction
+→ Save each batch in one short SQLite transaction (chunk text itself is never changed)
 ```
 
 | File | Responsibility |
 |---|---|
-| `config.py` | The one place that names the model and its settings |
+| `config.py` | The one place that names the model, its pinned revision, prefixes and settings |
 | `models.py` | Data shapes: `EmbeddingContract`, records, status, error types |
 | `vectors.py` | Text hash, normalization, float32 bytes (standard library only) |
-| `provider.py` | The local FastEmbed model; the only module that imports it |
+| `provider.py` | The local FastEmbed model and the pinned download; the only module that imports `fastembed` / `huggingface_hub` |
 | `storage.py` | SQL for the `embeddings` table |
 | `service.py` | The pipeline: chunks → model → SQLite, and the status report |
 
@@ -594,57 +607,130 @@ Chunks (SQLite, chunk_index order)
 
 | | |
 |---|---|
-| Library | [FastEmbed](https://github.com/qdrant/fastembed) 0.8.1 (ONNX Runtime, CPU only, no GPU/CUDA needed) |
-| Model | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (ONNX copy `qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q` on Hugging Face) |
-| License | Apache-2.0 |
-| Languages | ~50, including Chinese and English |
+| Library | [FastEmbed](https://github.com/qdrant/fastembed) 0.8.1 (ONNX Runtime, CPU only, no GPU/CUDA, no PyTorch) |
+| Model | [`intfloat/multilingual-e5-small`](https://huggingface.co/intfloat/multilingual-e5-small), file `onnx/model.onnx` (float32) |
+| Revision | `614241f622f53c4eeff9890bdc4f31cfecc418b3` (exact Hugging Face commit, pinned) |
+| License | MIT |
+| Languages | 94 according to the model card, including Chinese and English |
 | Dimension | 384 |
-| Max input | 128 tokens (longer text is cut; see limitations) |
-| Size | ~240 MB on disk, ~700 MB RAM while loaded |
+| Max input | 512 tokens, `passage: ` prefix included (longer text is cut; see limitations) |
+| Pooling | Mean pooling over the tokens, then L2 normalization (as in the model card) |
+| Size | ~470 MB on disk; ~0.8 GB RAM after loading, up to ~2 GB while embedding a batch of 16 long chunks |
 
-This is the project's **initial** embedding model, chosen because it is
-multilingual, small and CPU-friendly. It is **not** a final production choice,
-and nothing here measures retrieval quality yet.
+All values were checked against the official repository files at that
+revision (`config.json` → `hidden_size` 384, `tokenizer_config.json` →
+`model_max_length` 512, `1_Pooling/config.json` → mean pooling). At load
+time DocuBot checks the downloaded `config.json` and the tokenizer's real
+token limit again and refuses files that do not match (`500`, safe message).
 
-The model name is defined once in `app/embeddings/config.py`. Only models on
-FastEmbed's built-in supported list are accepted, so a model name can never
-point to arbitrary files or code.
+This model is the project's **current development baseline**, chosen because
+it is multilingual (Chinese + English), made for retrieval, runs on a CPU and
+reads 512 tokens (Batch 5's first model read only 128). It is **not** a
+proven "best" model: nothing here measures retrieval quality yet; that needs
+an evaluation set in a later batch.
+
+**How it is loaded.** FastEmbed 0.8.1 does not list this model (only
+`multilingual-e5-large`), so it is registered with FastEmbed's documented
+`TextEmbedding.add_custom_model()` (mean pooling, 384 dimensions,
+`onnx/model.onnx`). FastEmbed's own normalization is switched off; DocuBot
+normalizes every vector itself, so `normalized` in the contract is always the
+truth. The model name, revision, prefixes and limits are defined once, in
+`app/embeddings/config.py` (`MULTILINGUAL_E5_SMALL`). Only models listed
+there (`SUPPORTED_MODELS`) are accepted, so a configured name can never point
+to arbitrary files.
+
+### E5 input contract: `passage:` and `query:`
+
+E5 models are trained for **asymmetric retrieval**: a short question and a long
+document are different kinds of text, and the model must be told which one it
+is reading. The model card requires:
+
+| Text | Exact model input | Method |
+|---|---|---|
+| Document chunk | `passage: FastAPI is a Python web framework.` | `embed_documents()` |
+| Question (future search) | `query: What is FastAPI?` | `embed_query()` |
+
+- The prefix is added **only at embedding time**, in `provider.py`. The chunk
+  text stored in the `chunks` table is never changed and never starts with
+  `passage:`.
+- FastEmbed adds no prefix of its own for this model, so there is exactly one
+  place that adds it.
+- Using the wrong prefix does not crash anything; it silently makes search
+  worse. Tests therefore check that documents always use `passage: `, queries
+  always use `query: `, and that the service refuses a vector whose input hash
+  does not match `passage: ` + chunk text.
+- Both kinds of vectors come from the same model and live in the same
+  embedding space, so a query vector can later be compared with chunk vectors.
 
 ### Model cache and network
 
-- The model is downloaded **once** from Hugging Face into
-  `storage/model_cache/` the first time it is needed. This folder is ignored by
-  Git; model files are never committed.
+- The model files of the pinned revision are downloaded **once** from Hugging
+  Face into `storage/model_cache/` the first time they are needed (with
+  `huggingface_hub.snapshot_download(revision=...)`, then passed to FastEmbed
+  as `specific_model_path`). This folder is ignored by Git; model files are
+  never committed.
+- Only five files are downloaded: `config.json`, `tokenizer.json`,
+  `tokenizer_config.json`, `special_tokens_map.json` and `onnx/model.onnx`.
+  No Python code, pickle or PyTorch files are fetched or executed.
 - After that, loading uses only the local files; embedding never calls an
   external API (no OpenAI, Anthropic, Cohere, etc.). The smoke test verifies
   this with network access for Hugging Face switched off (`HF_HUB_OFFLINE=1`).
 - The model is loaded once per server process and reused for every request,
   never once per chunk.
-- **Supply-chain note:** downloaded model files are external inputs from a
-  third party. They are ONNX files run by ONNX Runtime (no Python code from the
-  model repo is executed), but this project does **not** yet pin a model
-  revision or verify file checksums.
+- Files of the old Batch 5 model (`models--qdrant--paraphrase-…`) may still be
+  in the cache folder; they are no longer used and can be deleted by hand.
+- **Supply-chain note:** model files are third-party inputs. The revision is
+  pinned to an exact commit, so the same files are downloaded every time, but
+  DocuBot does not compare its own checksums of the files. The integrity of
+  the download is left to `huggingface_hub`, and a cached copy counts as
+  complete when all five files exist (their sizes are not re-checked). If a
+  cached file is ever damaged, delete `storage/model_cache/models--intfloat--multilingual-e5-small/`
+  and it is downloaded again.
 
 ### Embedding contract and stale embeddings
 
-A vector is only meaningful together with the model that produced it, so every
-stored vector records its **contract**: `model_name`, `embedding_version`,
-`dimension`, `dtype` (`float32`) and `normalized`. It also records
-`text_sha256`, the SHA-256 of **exactly** the text given to the model.
+A vector is only meaningful together with the exact process that produced it,
+so every stored vector records its **contract**: `model_name`,
+`model_revision`, `embedding_version`, `dimension`, `max_tokens`,
+`passage_prefix`, `dtype` (`float32`) and `normalized`.
 
-A stored embedding is **valid** only if all of these match the current
-configuration and the chunk's current text. Otherwise it is **stale**: it is
-never treated as valid, the status endpoint counts it, and the next embed run
-replaces it. So:
+Two different texts are involved and are kept apart:
 
-- chunk text changes → hash changes → re-embedded
-- model or `EMBEDDING_VERSION` changes → every vector is stale → re-embedded
-- vectors from different models are never mixed
+| Field | SHA-256 of | Used for |
+|---|---|---|
+| `text_sha256` | the **original** chunk text (as stored in `chunks`) | noticing that a chunk's text changed |
+| `input_sha256` | the **exact model input**: `passage: ` + chunk text | proving which input produced the vector |
 
-**Normalization:** FastEmbed does **not** normalize this model's output, so
-DocuBot scales every vector to length 1 itself (`normalized = true`). Later,
-cosine similarity is then just a dot product. Normalization only changes the
-maths; it says nothing about retrieval quality.
+A stored embedding is **valid** only if every contract field matches the
+current configuration and both hashes match the chunk's current text.
+Otherwise it is **stale**: it is never treated as valid, the status endpoint
+counts it, and the next embed run replaces it. So:
+
+- chunk text changes → hashes change → re-embedded
+- model, revision, `EMBEDDING_VERSION`, token limit, passage prefix or
+  normalization changes → every vector is stale → re-embedded
+- vectors from different contracts are never mixed or counted together
+- changing only the **query** prefix does not make stored vectors stale
+  (stored vectors are always passages)
+
+`EMBEDDING_VERSION` is **2** since this batch (Batch 5A). Version 1 was
+`paraphrase-multilingual-MiniLM-L12-v2` (128 tokens, no prefix).
+
+**Normalization:** DocuBot scales every vector to length 1 itself
+(`normalized = true`). Later, cosine similarity is then just a dot product.
+Normalization only changes the maths; it says nothing about retrieval quality.
+
+### Upgrading a Batch 5 database
+
+A database created by Batch 5 is upgraded automatically the next time it is
+opened: the four new columns (`model_revision`, `max_tokens`,
+`passage_prefix`, `input_sha256`) are added with `ALTER TABLE`. Nothing is
+deleted: chunk text and chunk IDs stay exactly the same, and the old
+MiniLM vectors stay in the table, but their contract (old model, version 1,
+no revision, no prefix) never matches, so they are reported as
+`stale_embeddings` and are never used. Calling
+`POST /documents/{id}/embed` replaces them with E5 vectors (one row per
+chunk, no duplicates).
 
 ### Storage and idempotency
 
@@ -653,16 +739,17 @@ Vectors are stored in the existing SQLite database, table `embeddings`:
 | Column | Meaning |
 |---|---|
 | `chunk_id` | The chunk (primary key and foreign key to `chunks`) |
-| `model_name`, `embedding_version`, `dimension`, `dtype`, `normalized` | The contract |
-| `text_sha256` | Hash of the embedded text |
-| `truncated` | 1 if the model only read the first part of the text |
+| `model_name`, `model_revision`, `embedding_version`, `dimension`, `max_tokens`, `passage_prefix`, `dtype`, `normalized` | The contract |
+| `text_sha256` | Hash of the original chunk text |
+| `input_sha256` | Hash of the exact model input (`passage: ` + chunk text) |
+| `truncated` | 1 if the model only read the first part of the input |
 | `vector` | `dimension × 4` bytes: little-endian float32 BLOB (384 → 1536 bytes) |
 | `created_at` | When the vector was stored (metadata only) |
 
 - **One active embedding per chunk.** A replacement overwrites the old row
   (UPSERT); there are never hidden duplicate vectors.
-- **Idempotent:** a second run with the same chunks and model embeds nothing
-  (all chunks are skipped).
+- **Idempotent:** a second run with the same chunks and contract embeds
+  nothing (all chunks are skipped).
 - The model runs **outside** any database transaction. Each batch is then saved
   in one short transaction that re-checks that the chunk still exists and still
   has exactly the embedded text; otherwise the batch is not saved (`409`).
@@ -682,16 +769,25 @@ and no timestamps influence a vector.
 
 ### Embedding limitations
 
-- **The model reads at most 128 tokens per chunk.** With the default chunk
-  size (1200 characters) that is roughly the first half of an English chunk and
-  the first quarter of a Chinese chunk; the rest does not influence the vector.
-  In a test with 200 default-size chunks, all 200 were truncated. Such chunks
-  are flagged (`truncated_chunks`). Choosing a smaller chunk size or a model
-  with a longer input limit is an open decision for the next batch.
-- CPU speed on the development laptop (Intel i5-1334U): roughly 60 ms per
-  default-size chunk, plus a few seconds to load the model once.
+- **Long Chinese chunks are still truncated.** The model reads at most 512
+  tokens. Measured on this project's real chunks (default 1200 characters):
+  English ≈ 360 tokens and mixed Chinese/English ≈ 410–490 tokens fit
+  completely, but a full 1200-character Chinese chunk needs ≈ 770–820 tokens,
+  so only roughly its first 750–800 characters influence the vector. Such
+  chunks are flagged (`truncated_chunks`). In a benchmark of 47 real chunks,
+  1 was truncated (the old 128-token model: 45). The Batch 4 chunk size was
+  **not** changed in this batch (changing it would change every chunk ID);
+  token-aware or language-aware chunking is an open decision.
+- CPU speed on the development laptop (Intel i5-1334U, 16 GB RAM): loading the
+  cached model takes about 2–4 s; embedding takes roughly 160 ms per
+  default-size chunk (200 chunks ≈ 32 s), about 3× slower than the old
+  128-token model, because each chunk is read completely. Peak memory while
+  embedding batches of 16 long chunks was about 2 GB. The first download
+  (~490 MB) took about 80 s on the development network.
 - Embedding is synchronous; a large document keeps the request waiting.
 - Re-chunking deletes embeddings, even if the chunk text did not change.
+- Retrieval quality has **not** been evaluated; the model is a development
+  baseline, not a benchmark winner.
 - There is **no vector search, no vector database, no retrieval, no reranking,
   and no RAG answer generation** yet. Vectors are stored only.
 
@@ -714,8 +810,8 @@ and no timestamps influence a vector.
 4. `.env` must **never** be committed. It is already listed in `.gitignore`.
 
 The web API does not need the Telegram token. The first embed request
-downloads the embedding model (~240 MB) into `storage/model_cache/`; this needs
-internet access once.
+downloads the embedding model (~490 MB, pinned revision) into
+`storage/model_cache/`; this needs internet access once.
 
 ## Local Run
 

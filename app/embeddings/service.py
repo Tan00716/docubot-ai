@@ -1,8 +1,8 @@
 """The embedding pipeline for one document.
 
     find record -> must be "completed" -> load chunks (chunk_index order)
-    -> hash each chunk's text -> compare with stored embeddings
-    -> embed only missing/stale chunks, batch by batch
+    -> compare each chunk's text and the contract with stored embeddings
+    -> embed only missing/stale chunks, batch by batch ("passage: " + text)
     -> save each batch in its own short transaction
 
 Repeating it is safe (idempotent): chunks that already have a valid
@@ -67,7 +67,7 @@ def plan_embeddings(
         record = records.get(chunk.chunk_id)
         if record is None:
             missing.append(chunk)
-        elif record.is_valid_for(contract, text_sha256(chunk.text)):
+        elif record.is_valid_for(contract, chunk.text):
             valid.append(chunk)
         else:
             stale.append(chunk)
@@ -100,20 +100,28 @@ def get_embedding_status(
 
 
 def _embed_batch(provider: EmbeddingProvider, batch: list[Chunk]) -> list[NewEmbedding]:
-    # The text that is hashed is exactly the text that is given to the model.
-    texts = [chunk.text for chunk in batch]
-    results = provider.embed_documents(texts)
+    # The provider gets the ORIGINAL chunk text and adds the passage prefix
+    # itself. Its reported input hash must prove that it used exactly
+    # contract.passage_input(text); otherwise the vector is not saved.
+    contract = provider.contract
+    results = provider.embed_documents([chunk.text for chunk in batch])
     if len(results) != len(batch):
         raise EmbeddingError()
-    return [
-        NewEmbedding(
+    embeddings = []
+    for chunk, result in zip(batch, results):
+        expected_input_sha256 = text_sha256(contract.passage_input(chunk.text))
+        if result.input_sha256 != expected_input_sha256:
+            logger.error("Provider input does not match the passage contract for %s",
+                         chunk.chunk_id)
+            raise EmbeddingError()
+        embeddings.append(NewEmbedding(
             chunk_id=chunk.chunk_id,
-            text_sha256=text_sha256(text),
+            text_sha256=text_sha256(chunk.text),
+            input_sha256=expected_input_sha256,
             vector=result.vector,
             truncated=result.truncated,
-        )
-        for chunk, text, result in zip(batch, texts, results)
-    ]
+        ))
+    return embeddings
 
 
 def embed_document(

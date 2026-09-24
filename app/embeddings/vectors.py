@@ -16,10 +16,12 @@ FLOAT32_BYTES = struct.calcsize(_FLOAT32)  # 4
 
 
 def text_sha256(text: str) -> str:
-    """SHA-256 (hex) of the exact text given to the model.
+    """SHA-256 (hex) of a text, as UTF-8.
 
-    Used to notice when a chunk's text changed after it was embedded.
-    It is NOT an ID and has nothing to do with security here.
+    Used for two fingerprints of every stored vector: the original chunk text
+    (to notice when a chunk changed) and the exact model input with its prefix
+    (to prove which input produced the vector). It is NOT an ID and has
+    nothing to do with security here.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

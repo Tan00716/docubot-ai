@@ -27,21 +27,27 @@ logger = logging.getLogger(__name__)
 CORRUPTED_EMBEDDINGS_MESSAGE = "Stored embedding data is corrupted."
 
 RECORD_COLUMNS = (
-    "e.chunk_id, e.model_name, e.embedding_version, e.dimension, e.dtype, "
-    "e.normalized, e.text_sha256, e.truncated, e.created_at"
+    "e.chunk_id, e.model_name, e.model_revision, e.embedding_version, e.dimension, "
+    "e.max_tokens, e.passage_prefix, e.dtype, e.normalized, e.text_sha256, "
+    "e.input_sha256, e.truncated, e.created_at"
 )
 
 UPSERT_SQL = """
-INSERT INTO embeddings (chunk_id, model_name, embedding_version, dimension, dtype,
-                        normalized, text_sha256, truncated, vector, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO embeddings (chunk_id, model_name, model_revision, embedding_version, dimension,
+                        max_tokens, passage_prefix, dtype, normalized, text_sha256,
+                        input_sha256, truncated, vector, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (chunk_id) DO UPDATE SET
     model_name = excluded.model_name,
+    model_revision = excluded.model_revision,
     embedding_version = excluded.embedding_version,
     dimension = excluded.dimension,
+    max_tokens = excluded.max_tokens,
+    passage_prefix = excluded.passage_prefix,
     dtype = excluded.dtype,
     normalized = excluded.normalized,
     text_sha256 = excluded.text_sha256,
+    input_sha256 = excluded.input_sha256,
     truncated = excluded.truncated,
     vector = excluded.vector,
     created_at = excluded.created_at
@@ -50,19 +56,26 @@ ON CONFLICT (chunk_id) DO UPDATE SET
 
 def _to_record(row: tuple) -> EmbeddingRecord:
     """Turn a database row into an EmbeddingRecord, checking every type."""
-    chunk_id, model_name, version, dimension, dtype, normalized, sha, truncated, created = row
-    if not all(isinstance(value, str) for value in (chunk_id, model_name, dtype, sha, created)):
+    (chunk_id, model_name, revision, version, dimension, max_tokens, prefix, dtype,
+     normalized, sha, input_sha, truncated, created) = row
+    texts = (chunk_id, model_name, revision, prefix, dtype, sha, input_sha, created)
+    numbers = (version, dimension, max_tokens, normalized, truncated)
+    if not all(isinstance(value, str) for value in texts):
         raise ValueError("Invalid embedding text field.")
-    if not all(isinstance(value, int) for value in (version, dimension, normalized, truncated)):
+    if not all(isinstance(value, int) for value in numbers):
         raise ValueError("Invalid embedding number field.")
     return EmbeddingRecord(
         chunk_id=chunk_id,
         model_name=model_name,
+        model_revision=revision,
         embedding_version=version,
         dimension=dimension,
+        max_tokens=max_tokens,
+        passage_prefix=prefix,
         dtype=dtype,
         normalized=bool(normalized),
         text_sha256=sha,
+        input_sha256=input_sha,
         truncated=bool(truncated),
         created_at=created,
     )
@@ -125,11 +138,15 @@ def save_embeddings(
             (
                 embedding.chunk_id,
                 contract.model_name,
+                contract.model_revision,
                 contract.embedding_version,
                 contract.dimension,
+                contract.max_tokens,
+                contract.passage_prefix,
                 contract.dtype,
                 int(contract.normalized),
                 embedding.text_sha256,
+                embedding.input_sha256,
                 int(embedding.truncated),
                 serialize_vector(embedding.vector, contract.dimension),
                 now,

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from app.document_processing.models import ProcessingError
+from app.embeddings.vectors import text_sha256
 
 
 @dataclass(frozen=True)
@@ -16,13 +17,30 @@ class EmbeddingContract:
 
     A vector is only meaningful together with the model that produced it.
     Two vectors may only be compared if their contracts are equal.
+
+    Two kinds of text are involved and must not be confused:
+        original text - the chunk text as stored in the "chunks" table
+        model input   - what the model really reads: prefix + original text
+    The prefix exists only at embedding time; it is never saved as chunk text.
     """
 
     model_name: str
+    model_revision: str  # exact Hugging Face commit of the model files
     embedding_version: int
     dimension: int  # how many numbers each vector has (384 for the default model)
+    max_tokens: int  # the model reads at most this many tokens of each input
+    passage_prefix: str  # added before a document chunk, e.g. "passage: "
+    query_prefix: str  # added before a search question, e.g. "query: "
     dtype: str  # "float32"
     normalized: bool  # True: every vector has length 1
+
+    def passage_input(self, text: str) -> str:
+        """The exact model input for a document chunk."""
+        return self.passage_prefix + text
+
+    def query_input(self, text: str) -> str:
+        """The exact model input for a search question."""
+        return self.query_prefix + text
 
 
 @dataclass(frozen=True)
@@ -30,7 +48,8 @@ class EmbeddedText:
     """What the provider returns for one input text."""
 
     vector: tuple[float, ...]
-    truncated: bool  # the model only read the first part of the text
+    truncated: bool  # the model only read the first part of the input
+    input_sha256: str  # SHA-256 of the exact model input (prefix included)
 
 
 @dataclass(frozen=True)
@@ -38,34 +57,49 @@ class NewEmbedding:
     """One vector ready to be stored for a chunk."""
 
     chunk_id: str
-    text_sha256: str  # SHA-256 of exactly the text given to the model
+    text_sha256: str  # SHA-256 of the ORIGINAL chunk text (no prefix)
+    input_sha256: str  # SHA-256 of the exact model input (prefix + chunk text)
     vector: tuple[float, ...]
     truncated: bool
 
 
 @dataclass(frozen=True)
 class EmbeddingRecord:
-    """Metadata of one stored embedding (the vector itself is not loaded)."""
+    """Metadata of one stored embedding (the vector itself is not loaded).
+
+    Together these fields answer "which exact contract produced this vector?".
+    """
 
     chunk_id: str
     model_name: str
+    model_revision: str
     embedding_version: int
     dimension: int
+    max_tokens: int
+    passage_prefix: str
     dtype: str
     normalized: bool
-    text_sha256: str
+    text_sha256: str  # SHA-256 of the original chunk text
+    input_sha256: str  # SHA-256 of passage_prefix + chunk text (what the model read)
     truncated: bool
     created_at: str
 
-    def is_valid_for(self, contract: EmbeddingContract, text_sha256: str) -> bool:
-        """True only if this vector was made by `contract` from exactly this text."""
+    def is_valid_for(self, contract: EmbeddingContract, chunk_text: str) -> bool:
+        """True only if this vector was made by `contract` from exactly this chunk text.
+
+        The query prefix is not compared: stored vectors are always passages.
+        """
         return (
             self.model_name == contract.model_name
+            and self.model_revision == contract.model_revision
             and self.embedding_version == contract.embedding_version
             and self.dimension == contract.dimension
+            and self.max_tokens == contract.max_tokens
+            and self.passage_prefix == contract.passage_prefix
             and self.dtype == contract.dtype
             and self.normalized == contract.normalized
-            and self.text_sha256 == text_sha256
+            and self.text_sha256 == text_sha256(chunk_text)
+            and self.input_sha256 == text_sha256(contract.passage_input(chunk_text))
         )
 
 
@@ -136,6 +170,12 @@ class EmbeddingModelUnavailableError(ProcessingError):
         "The embedding model could not be loaded. On the first run it is downloaded "
         "once; check the internet connection and try again."
     )
+
+
+class EmbeddingModelMismatchError(ProcessingError):
+    """The downloaded model files do not match the configured model spec."""
+
+    safe_message = "The embedding model files do not match the expected model configuration."
 
 
 class NoChunksError(ProcessingError):

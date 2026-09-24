@@ -1,16 +1,21 @@
-"""Unit tests for embeddings: config, vectors, provider logic and planning.
+"""Unit tests for embeddings: config, contract, vectors, provider logic and planning.
 
-No model is downloaded or loaded here: FastEmbed's TextEmbedding class is
-replaced by a small fake. The real model is tested in test_embedding_smoke.py.
+No model is downloaded or loaded here: FastEmbed's TextEmbedding class and
+the Hugging Face download are replaced by small fakes. The real model is
+tested in test_embedding_smoke.py.
 
 Run from the project root:
 
     .venv\\Scripts\\python.exe -m unittest discover -s tests -v
 """
 
+import dataclasses
+import json
 import logging
 import math
+import shutil
 import struct
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -18,26 +23,32 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.document_processing.models import Chunk
+from app.embeddings import config as config_module
 from app.embeddings import provider as provider_module
 from app.embeddings.config import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_MODEL_NAME,
     EMBEDDING_VERSION,
     MAX_BATCH_SIZE,
+    MULTILINGUAL_E5_SMALL,
+    SUPPORTED_MODELS,
     VECTOR_DTYPE,
     EmbeddingConfig,
+    EmbeddingModelSpec,
+    get_model_spec,
     validate_batch_size,
 )
 from app.embeddings.models import (
     EmbeddingContract,
     EmbeddingDimensionError,
     EmbeddingError,
+    EmbeddingModelMismatchError,
     EmbeddingModelUnavailableError,
     EmbeddingRecord,
     InvalidEmbeddingConfigError,
     UnsupportedEmbeddingModelError,
 )
-from app.embeddings.provider import FastEmbedProvider, model_dimension
+from app.embeddings.provider import FastEmbedProvider, build_contract, download_model_files
 from app.embeddings.service import plan_embeddings
 from app.embeddings.vectors import (
     deserialize_vector,
@@ -46,11 +57,13 @@ from app.embeddings.vectors import (
     text_sha256,
     to_float32,
 )
+from fake_embeddings import make_fake_contract
 
 logging.getLogger("app").setLevel(logging.CRITICAL)  # failures are provoked on purpose
 
 CACHE = Path("unused-cache")
 FAKE_MODEL = "fake/model"
+OLD_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 
 # --- Configuration ------------------------------------------------------------
@@ -60,14 +73,35 @@ class EmbeddingConfigTests(unittest.TestCase):
     def test_defaults(self):
         config = EmbeddingConfig(cache_dir=CACHE)
 
-        self.assertEqual(config.model_name,
-                         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+        self.assertEqual(config.model_name, "intfloat/multilingual-e5-small")
         self.assertEqual(config.model_name, DEFAULT_MODEL_NAME)
         self.assertEqual(config.embedding_version, EMBEDDING_VERSION)
         self.assertTrue(config.normalize_embeddings)
         self.assertEqual(config.batch_size, DEFAULT_BATCH_SIZE)
         self.assertEqual(DEFAULT_BATCH_SIZE, 16)
         self.assertEqual(VECTOR_DTYPE, "float32")
+
+    def test_embedding_version_was_bumped_for_the_new_model(self):
+        # Version 1 was paraphrase-multilingual-MiniLM-L12-v2 (Batch 5).
+        self.assertEqual(EMBEDDING_VERSION, 2)
+
+    def test_e5_spec_matches_the_official_model_files(self):
+        spec = get_model_spec(DEFAULT_MODEL_NAME)
+
+        self.assertIs(spec, MULTILINGUAL_E5_SMALL)
+        self.assertEqual((spec.dimension, spec.max_tokens, spec.pooling, spec.license),
+                         (384, 512, "mean", "mit"))
+        self.assertEqual((spec.passage_prefix, spec.query_prefix), ("passage: ", "query: "))
+        self.assertEqual(spec.model_file, "onnx/model.onnx")
+        self.assertEqual(spec.revision, "614241f622f53c4eeff9890bdc4f31cfecc418b3")
+        self.assertRegex(spec.revision, r"^[0-9a-f]{40}$", "a full git commit, not a branch")
+
+    def test_only_listed_models_are_supported(self):
+        self.assertEqual(set(SUPPORTED_MODELS), {"intfloat/multilingual-e5-small"})
+        for name in [OLD_MODEL, "intfloat/multilingual-e5-base", "someone/unknown", ""]:
+            with self.subTest(model=name):
+                with self.assertRaises(UnsupportedEmbeddingModelError):
+                    get_model_spec(name)
 
     def test_model_name_and_version_are_configurable(self):
         config = EmbeddingConfig(cache_dir=CACHE, model_name="other/model", embedding_version=7)
@@ -106,6 +140,33 @@ class EmbeddingConfigTests(unittest.TestCase):
 
                 self.assertEqual(caught.exception.safe_message,
                                  f"batch_size must be a whole number from 1 to {MAX_BATCH_SIZE}.")
+
+
+# --- Contract -----------------------------------------------------------------
+
+
+class EmbeddingContractTests(unittest.TestCase):
+    def test_default_contract_is_the_e5_contract(self):
+        contract = build_contract(EmbeddingConfig(cache_dir=CACHE))
+
+        self.assertEqual(contract, EmbeddingContract(
+            model_name="intfloat/multilingual-e5-small",
+            model_revision="614241f622f53c4eeff9890bdc4f31cfecc418b3",
+            embedding_version=2, dimension=384, max_tokens=512,
+            passage_prefix="passage: ", query_prefix="query: ",
+            dtype="float32", normalized=True))
+
+    def test_passage_and_query_inputs(self):
+        contract = build_contract(EmbeddingConfig(cache_dir=CACHE))
+
+        self.assertEqual(contract.passage_input("FastAPI is a Python web framework."),
+                         "passage: FastAPI is a Python web framework.")
+        self.assertEqual(contract.query_input("What is FastAPI?"), "query: What is FastAPI?")
+        self.assertEqual(contract.passage_input("你好"), "passage: 你好")
+
+    def test_unsupported_model_has_no_contract(self):
+        with self.assertRaises(UnsupportedEmbeddingModelError):
+            build_contract(EmbeddingConfig(cache_dir=CACHE, model_name=OLD_MODEL))
 
 
 # --- Vectors ------------------------------------------------------------------
@@ -182,7 +243,14 @@ class VectorSerializationTests(unittest.TestCase):
             l2_normalize([0.0, 0.0])
 
 
-# --- Provider (FastEmbed replaced by a fake) ------------------------------------
+
+# --- Provider (FastEmbed and the download replaced by fakes) ---------------------
+
+FAKE_SPEC = EmbeddingModelSpec(
+    name=FAKE_MODEL, revision="c" * 40, model_file="onnx/model.onnx", dimension=4,
+    max_tokens=512, pooling="mean", passage_prefix="passage: ", query_prefix="query: ",
+    license="mit",
+)
 
 
 class FakeArray:
@@ -196,27 +264,40 @@ class FakeArray:
 
 
 def make_fake_text_embedding(dimension=4, vector=None, fail_load=False, fail_embed=False,
-                             token_limit=5):
-    """A fake FastEmbed TextEmbedding class with its own counters."""
+                             token_limit=5, tokenizer_max_length=512, built_in=()):
+    """A fake FastEmbed TextEmbedding class with its own counters.
+
+    The fake tokenizer counts words; an input with more than token_limit
+    words is reported as overflowing (truncated).
+    """
 
     class FakeTextEmbedding:
         loads = 0
         instances = []
+        custom_models = []
 
-        def __init__(self, model_name, cache_dir):
+        def __init__(self, model_name, cache_dir, specific_model_path, providers):
             type(self).loads += 1
             if fail_load:
                 raise RuntimeError("download failed at C:\\secret\\cache\\path")
             self.model_name, self.cache_dir = model_name, cache_dir
+            self.specific_model_path, self.providers = specific_model_path, providers
             self.embed_calls = []
-            tokenizer = SimpleNamespace(encode=lambda text: SimpleNamespace(
-                overflowing=["cut"] if len(text.split()) > token_limit else []))
+            tokenizer = SimpleNamespace(
+                encode=lambda text: SimpleNamespace(
+                    overflowing=["cut"] if len(text.split()) > token_limit else []),
+                truncation={"max_length": tokenizer_max_length},
+            )
             self.model = SimpleNamespace(tokenizer=tokenizer)
             type(self).instances.append(self)
 
         @staticmethod
         def list_supported_models():
-            return [{"model": FAKE_MODEL, "dim": dimension}, {"model": "fake/other", "dim": 2}]
+            return [{"model": name, "dim": 2} for name in built_in]
+
+        @classmethod
+        def add_custom_model(cls, **description):
+            cls.custom_models.append(description)
 
         def _vector(self):
             return FakeArray(vector if vector is not None else [3.0, 4.0] + [0.0] * (dimension - 2))
@@ -228,14 +309,30 @@ def make_fake_text_embedding(dimension=4, vector=None, fail_load=False, fail_emb
             self.embed_calls.append((texts, batch_size))
             return (self._vector() for _ in texts)
 
-        def query_embed(self, query):
-            self.embed_calls.append(([query], "query"))
-            return iter([self._vector()])
-
     return FakeTextEmbedding
 
 
 class ProviderTestCase(unittest.TestCase):
+    def setUp(self):
+        self.model_dir = Path(tempfile.mkdtemp(prefix="docubot-fake-model-"))
+        self.addCleanup(shutil.rmtree, self.model_dir, ignore_errors=True)
+        self.write_model_config(hidden_size=4)
+        self.downloads = []
+        for patcher in [
+            patch.dict(config_module.SUPPORTED_MODELS, {FAKE_MODEL: FAKE_SPEC}),
+            patch.object(provider_module, "_registered_models", {}),
+            patch.object(provider_module, "download_model_files", side_effect=self.fake_download),
+        ]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write_model_config(self, **config):
+        (self.model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    def fake_download(self, spec, cache_dir):
+        self.downloads.append((spec.name, spec.revision, cache_dir))
+        return self.model_dir
+
     def make_provider(self, normalize=True, model_name=FAKE_MODEL, **fake_options):
         fake = make_fake_text_embedding(**fake_options)
         text_embedding_patch = patch.object(provider_module, "TextEmbedding", fake)
@@ -251,19 +348,55 @@ class ProviderTests(ProviderTestCase):
         provider, fake = self.make_provider()
 
         self.assertEqual(provider.contract, EmbeddingContract(
-            model_name=FAKE_MODEL, embedding_version=EMBEDDING_VERSION, dimension=4,
+            model_name=FAKE_MODEL, model_revision="c" * 40, embedding_version=EMBEDDING_VERSION,
+            dimension=4, max_tokens=512, passage_prefix="passage: ", query_prefix="query: ",
             dtype="float32", normalized=True))
-        self.assertEqual(fake.loads, 0)
-
-    def test_real_fastembed_list_gives_384_dimensions_for_default_model(self):
-        # Reads FastEmbed's built-in model list only; nothing is downloaded.
-        self.assertEqual(model_dimension(DEFAULT_MODEL_NAME), 384)
+        self.assertEqual((fake.loads, self.downloads), (0, []))
 
     def test_unsupported_model_is_rejected(self):
         with self.assertRaises(UnsupportedEmbeddingModelError):
-            model_dimension("someone/unknown-model")
-        with self.assertRaises(UnsupportedEmbeddingModelError):
             self.make_provider(model_name="someone/unknown-model")
+        with self.assertRaises(UnsupportedEmbeddingModelError):
+            self.make_provider(model_name=OLD_MODEL)
+
+    def test_model_is_registered_with_fastembed_once_with_the_spec_settings(self):
+        provider, fake = self.make_provider()
+
+        provider.embed_documents(["a"])
+        FastEmbedProvider(provider.config).embed_documents(["b"])
+
+        self.assertEqual(fake.custom_models, [{
+            "model": FAKE_MODEL, "pooling": provider_module.PoolingType.MEAN,
+            "normalization": False, "sources": provider_module.ModelSource(hf=FAKE_MODEL),
+            "dim": 4, "model_file": "onnx/model.onnx", "license": "mit",
+        }])
+
+    def test_changed_spec_for_an_already_registered_model_is_refused(self):
+        provider, fake = self.make_provider()
+        provider.embed_documents(["a"])
+        bumped = dataclasses.replace(FAKE_SPEC, revision="d" * 40)
+
+        with patch.dict(config_module.SUPPORTED_MODELS, {FAKE_MODEL: bumped}):
+            with self.assertRaises(UnsupportedEmbeddingModelError):
+                FastEmbedProvider(provider.config).embed_documents(["b"])
+
+        self.assertEqual(len(fake.custom_models), 1, "FastEmbed keeps only the first spec")
+
+    def test_model_that_fastembed_already_defines_is_refused(self):
+        provider, _ = self.make_provider(built_in=[FAKE_MODEL.upper()])
+
+        with self.assertRaises(UnsupportedEmbeddingModelError):
+            provider.embed_documents(["a"])
+
+    def test_pinned_files_are_loaded_on_the_cpu(self):
+        provider, fake = self.make_provider()
+
+        provider.embed_documents(["a"])
+
+        self.assertEqual(self.downloads, [(FAKE_MODEL, "c" * 40, CACHE)])
+        model = fake.instances[0]
+        self.assertEqual(model.specific_model_path, str(self.model_dir))
+        self.assertEqual(model.providers, ["CPUExecutionProvider"])
 
     def test_one_text_gives_one_normalized_float32_vector(self):
         provider, _ = self.make_provider()
@@ -276,13 +409,46 @@ class ProviderTests(ProviderTestCase):
         self.assertAlmostEqual(math.sqrt(sum(x * x for x in result.vector)), 1.0, places=6)
         self.assertTrue(all(isinstance(x, float) for x in result.vector))
 
-    def test_several_texts_are_embedded_in_one_model_call(self):
+    def test_documents_are_embedded_as_passages_in_one_model_call(self):
         provider, fake = self.make_provider()
+        texts = ["one", "two", "三"]
 
-        results = provider.embed_documents(["one", "two", "three"])
+        results = provider.embed_documents(texts)
 
         self.assertEqual(len(results), 3)
-        self.assertEqual(fake.instances[0].embed_calls, [(["one", "two", "three"], 3)])
+        self.assertEqual(fake.instances[0].embed_calls,
+                         [(["passage: one", "passage: two", "passage: 三"], 3)])
+        self.assertEqual(texts, ["one", "two", "三"], "the caller's texts are not changed")
+
+    def test_reported_input_hash_is_of_the_prefixed_text(self):
+        provider, _ = self.make_provider()
+
+        [result] = provider.embed_documents(["FastAPI is a Python web framework."])
+
+        self.assertEqual(result.input_sha256,
+                         text_sha256("passage: FastAPI is a Python web framework."))
+        self.assertNotEqual(result.input_sha256,
+                            text_sha256("FastAPI is a Python web framework."))
+
+    def test_query_is_embedded_with_the_query_prefix_only(self):
+        provider, fake = self.make_provider()
+
+        vector = provider.embed_query("What is FastAPI?")
+
+        self.assertEqual(vector, to_float32([0.6, 0.8, 0.0, 0.0]))
+        self.assertEqual(fake.instances[0].embed_calls, [(["query: What is FastAPI?"], 1)])
+
+    def test_passage_and_query_prefixes_are_never_swapped(self):
+        provider, fake = self.make_provider()
+
+        provider.embed_documents(["FastAPI is a Python web framework."])
+        provider.embed_query("What is FastAPI?")
+
+        [(document_inputs, _), (query_inputs, _)] = fake.instances[0].embed_calls
+        self.assertTrue(all(i.startswith("passage: ") and "query: " not in i
+                            for i in document_inputs))
+        self.assertTrue(all(i.startswith("query: ") and "passage: " not in i
+                            for i in query_inputs))
 
     def test_normalization_can_be_switched_off(self):
         provider, _ = self.make_provider(normalize=False)
@@ -299,7 +465,7 @@ class ProviderTests(ProviderTestCase):
         provider.embed_documents(["b", "c"])
         provider.embed_query("d")
 
-        self.assertEqual(fake.loads, 1)
+        self.assertEqual((fake.loads, len(self.downloads)), (1, 1))
 
     def test_concurrent_first_calls_load_the_model_once(self):
         provider, fake = self.make_provider()
@@ -336,13 +502,14 @@ class ProviderTests(ProviderTestCase):
 
         self.assertEqual(first, second)
 
-    def test_truncated_texts_are_flagged(self):
-        provider, _ = self.make_provider(token_limit=3)
+    def test_truncation_is_measured_on_the_prefixed_input(self):
+        provider, _ = self.make_provider(token_limit=4)
 
-        short, long = provider.embed_documents(["a b c", "a b c d e"])
+        # "passage: a b c" has 4 "tokens"; the prefix pushes "a b c d" over the limit.
+        short, borderline = provider.embed_documents(["a b c", "a b c d"])
 
         self.assertFalse(short.truncated)
-        self.assertTrue(long.truncated)
+        self.assertTrue(borderline.truncated)
 
     def test_model_load_failure_gives_safe_error(self):
         provider, _ = self.make_provider(fail_load=True)
@@ -352,6 +519,38 @@ class ProviderTests(ProviderTestCase):
 
         self.assertNotIn("secret", caught.exception.safe_message)
         self.assertIn("downloaded once", caught.exception.safe_message)
+
+    def test_download_failure_gives_safe_error(self):
+        provider, _ = self.make_provider()
+
+        with patch.object(provider_module, "download_model_files",
+                          side_effect=OSError("C:\\secret\\path")):
+            with self.assertRaises(EmbeddingModelUnavailableError):
+                provider.embed_documents(["text"])
+
+    def test_model_files_with_another_dimension_are_refused(self):
+        self.write_model_config(hidden_size=768)
+        provider, _ = self.make_provider()
+
+        with self.assertRaises(EmbeddingModelMismatchError):
+            provider.embed_documents(["text"])
+
+    def test_tokenizer_with_another_token_limit_is_refused(self):
+        for limit in [128, 514, None]:
+            with self.subTest(max_length=limit):
+                provider, _ = self.make_provider(tokenizer_max_length=limit)
+
+                with self.assertRaises(EmbeddingModelMismatchError):
+                    provider.embed_documents(["text"])
+
+    def test_missing_model_config_is_refused(self):
+        (self.model_dir / "config.json").unlink()
+        provider, _ = self.make_provider()
+
+        with self.assertRaises(EmbeddingModelMismatchError) as caught:
+            provider.embed_documents(["text"])
+
+        self.assertNotIn(str(self.model_dir), caught.exception.safe_message)
 
     def test_model_failure_during_embedding_gives_safe_error(self):
         provider, _ = self.make_provider(fail_embed=True)
@@ -366,6 +565,8 @@ class ProviderTests(ProviderTestCase):
 
         with self.assertRaises(EmbeddingDimensionError):
             provider.embed_documents(["text"])
+        with self.assertRaises(EmbeddingDimensionError):
+            provider.embed_query("text")
 
     def test_nan_or_zero_vectors_are_rejected(self):
         for vector in [[math.nan, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]:
@@ -375,13 +576,51 @@ class ProviderTests(ProviderTestCase):
                 with self.assertRaises(EmbeddingError):
                     provider.embed_documents(["text"])
 
-    def test_query_uses_the_same_model_and_normalization(self):
-        provider, fake = self.make_provider()
 
-        vector = provider.embed_query("What is FastAPI?")
+class DownloadTests(unittest.TestCase):
+    """download_model_files with huggingface_hub.snapshot_download replaced."""
 
-        self.assertEqual(vector, to_float32([0.6, 0.8, 0.0, 0.0]))
-        self.assertEqual(fake.instances[0].embed_calls, [(["What is FastAPI?"], "query")])
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp(prefix="docubot-snapshot-"))
+        self.addCleanup(shutil.rmtree, self.folder, ignore_errors=True)
+        self.calls = []
+
+    def fake_snapshot_download(self, **options):
+        self.calls.append(options)
+        return str(self.folder)
+
+    def download(self):
+        with patch.object(provider_module, "snapshot_download",
+                          side_effect=self.fake_snapshot_download):
+            return download_model_files(MULTILINGUAL_E5_SMALL, CACHE)
+
+    def test_pinned_revision_and_only_the_needed_files_are_requested(self):
+        self.download()
+
+        for call in self.calls:
+            self.assertEqual(call["repo_id"], "intfloat/multilingual-e5-small")
+            self.assertEqual(call["revision"], "614241f622f53c4eeff9890bdc4f31cfecc418b3")
+            self.assertEqual(call["cache_dir"], str(CACHE))
+            self.assertEqual(call["allow_patterns"], [
+                "config.json", "tokenizer.json", "tokenizer_config.json",
+                "special_tokens_map.json", "onnx/model.onnx"])
+            self.assertFalse(any(p.endswith((".bin", ".pt", ".pkl", ".py", ".safetensors"))
+                                 for p in call["allow_patterns"]))
+
+    def test_complete_local_copy_is_used_without_network(self):
+        for name in provider_module.model_files(MULTILINGUAL_E5_SMALL):
+            (self.folder / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.folder / name).write_bytes(b"x")
+
+        self.assertEqual(self.download(), self.folder)
+        self.assertEqual([call.get("local_files_only") for call in self.calls], [True])
+
+    def test_incomplete_local_copy_is_downloaded_again(self):
+        (self.folder / "config.json").write_bytes(b"{}")  # the ONNX file is missing
+
+        self.download()
+
+        self.assertEqual([call.get("local_files_only") for call in self.calls], [True, None])
 
 
 # --- Planning (which chunks need a new vector) -----------------------------------
@@ -396,15 +635,18 @@ def make_chunk(index, text, document_id="a" * 32):
     )
 
 
-CONTRACT = EmbeddingContract(model_name="fake/model", embedding_version=1, dimension=8,
-                             dtype="float32", normalized=True)
+CONTRACT = make_fake_contract(model_name="fake/model", dimension=8)
 
 
 def make_record(chunk, **changes):
     values = dict(chunk_id=chunk.chunk_id, model_name=CONTRACT.model_name,
+                  model_revision=CONTRACT.model_revision,
                   embedding_version=CONTRACT.embedding_version, dimension=CONTRACT.dimension,
+                  max_tokens=CONTRACT.max_tokens, passage_prefix=CONTRACT.passage_prefix,
                   dtype=CONTRACT.dtype, normalized=CONTRACT.normalized,
-                  text_sha256=text_sha256(chunk.text), truncated=False, created_at="t")
+                  text_sha256=text_sha256(chunk.text),
+                  input_sha256=text_sha256(CONTRACT.passage_input(chunk.text)),
+                  truncated=False, created_at="t")
     return EmbeddingRecord(**(values | changes))
 
 
@@ -425,9 +667,17 @@ class PlanEmbeddingsTests(unittest.TestCase):
         chunk = make_chunk(0, "text")
         changes = {
             "text changed": {"text_sha256": text_sha256("old text")},
+            "input without prefix": {"input_sha256": text_sha256("text")},
+            "input with query prefix": {"input_sha256": text_sha256("query: text")},
             "other model": {"model_name": "other/model"},
-            "other version": {"embedding_version": 2},
+            "old Batch 5 model": {"model_name": OLD_MODEL, "embedding_version": 1,
+                                  "model_revision": "", "max_tokens": 0,
+                                  "passage_prefix": "", "input_sha256": ""},
+            "other revision": {"model_revision": "d" * 40},
+            "other version": {"embedding_version": 1},
             "other dimension": {"dimension": 16},
+            "other token limit": {"max_tokens": 128},
+            "other passage prefix": {"passage_prefix": ""},
             "other normalization": {"normalized": False},
             "unsupported dtype": {"dtype": "float16"},
         }
@@ -446,6 +696,16 @@ class PlanEmbeddingsTests(unittest.TestCase):
 
         self.assertEqual(plan.valid, (chunk,))
         self.assertEqual(plan.to_embed, [])
+
+    def test_changing_only_the_query_prefix_keeps_stored_passages_valid(self):
+        # Stored vectors are passages; the query prefix never touched them.
+        chunk = make_chunk(0, "text")
+        other_query = make_fake_contract(model_name="fake/model", dimension=8,
+                                         query_prefix="question: ")
+
+        plan = plan_embeddings([chunk], {chunk.chunk_id: make_record(chunk)}, other_query)
+
+        self.assertEqual(plan.valid, (chunk,))
 
 
 if __name__ == "__main__":
