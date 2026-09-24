@@ -220,3 +220,9 @@ __marimo__/
 # DocuBot AI: local upload storage. Keep the folder, never commit uploaded files.
 storage/uploads/*
 !storage/uploads/.gitkeep
+
+# DocuBot AI: processed documents and the local SQLite metadata database.
+storage/processed/*
+!storage/processed/.gitkeep
+storage/metadata/*
+!storage/metadata/.gitkeep

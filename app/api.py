@@ -1,10 +1,12 @@
 """Minimal FastAPI web API for DocuBot AI.
 
 Endpoints:
-    GET  /health  -> check that the API is running
-    POST /upload  -> validate one document and save it to local storage
+    GET  /health                          -> check that the API is running
+    POST /upload                          -> validate one document and save it
+    POST /documents/{document_id}/process -> extract and normalize its text
+    GET  /documents/{document_id}         -> processing status and metadata
 
-Uploaded files are only stored. They are NOT parsed, chunked or indexed yet.
+Processing is synchronous. Documents are NOT chunked or indexed yet.
 
 Run locally from the project root:
 
@@ -19,10 +21,27 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from app.document_processing import database
+from app.document_processing.models import (
+    AlreadyProcessingError,
+    DocumentContentError,
+    DocumentNotFoundError,
+    DocumentRecord,
+    InvalidDocumentIdError,
+    ProcessingError,
+    StorageError,
+    StoredFileMissingError,
+    UnsupportedFileTypeError,
+)
+from app.document_processing.processor import find_document, process_document
+
 # --- Configuration ----------------------------------------------------------
 
-# Project root is the folder above app/. Uploads go to <project>/storage/uploads.
-UPLOAD_DIR = Path(__file__).resolve().parent.parent / "storage" / "uploads"
+# Project root is the folder above app/. Everything is stored under <project>/storage.
+STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
+UPLOAD_DIR = STORAGE_DIR / "uploads"
+PROCESSED_DIR = STORAGE_DIR / "processed"
+DATABASE_PATH = STORAGE_DIR / "metadata" / "documents.db"
 
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_FILENAME_LENGTH = 255
@@ -44,6 +63,43 @@ class UploadResponse(BaseModel):
     status: str
 
 
+class DocumentResponse(BaseModel):
+    """Document metadata and processing status (never the extracted text)."""
+
+    document_id: str
+    original_filename: str
+    file_type: str
+    content_type: str | None
+    size_bytes: int
+    status: str
+    created_at: str
+    updated_at: str
+    processed_path: str | None  # filename inside storage/processed/
+    error_message: str | None
+
+    @classmethod
+    def from_record(cls, record: DocumentRecord, **extra) -> "DocumentResponse":
+        return cls(
+            document_id=record.document_id,
+            original_filename=record.original_filename,
+            file_type=record.extension,
+            content_type=record.content_type,
+            size_bytes=record.size_bytes,
+            status=record.status.value,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            processed_path=record.processed_path,
+            error_message=record.error_message,
+            **extra,
+        )
+
+
+class ProcessResponse(DocumentResponse):
+    """Returned after successful processing."""
+
+    section_count: int
+
+
 app = FastAPI(title="DocuBot AI API")
 
 
@@ -57,6 +113,27 @@ async def handle_unexpected_error(request: Request, exc: Exception) -> JSONRespo
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "Internal server error."},
     )
+
+
+# Which HTTP status each processing error becomes. Only the error's
+# safe_message is returned to the user.
+PROCESSING_ERROR_STATUS = {
+    InvalidDocumentIdError: status.HTTP_400_BAD_REQUEST,
+    DocumentNotFoundError: status.HTTP_404_NOT_FOUND,
+    StoredFileMissingError: status.HTTP_404_NOT_FOUND,
+    AlreadyProcessingError: status.HTTP_409_CONFLICT,
+    UnsupportedFileTypeError: status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+    DocumentContentError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    StorageError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+}
+
+
+@app.exception_handler(ProcessingError)
+async def handle_processing_error(request: Request, exc: ProcessingError) -> JSONResponse:
+    status_code = PROCESSING_ERROR_STATUS.get(
+        type(exc), status.HTTP_500_INTERNAL_SERVER_ERROR
+    )
+    return JSONResponse(status_code=status_code, content={"detail": exc.safe_message})
 
 
 def api_error(status_code: int, message: str) -> HTTPException:
@@ -145,6 +222,24 @@ def upload(file: Annotated[UploadFile, File()]) -> UploadResponse:
             status.HTTP_500_INTERNAL_SERVER_ERROR, "Could not store the file."
         )
 
+    # Record the upload so it can be processed later (status "uploaded").
+    try:
+        database.create_document(
+            DATABASE_PATH,
+            document_id=file_id,
+            original_filename=filename,
+            stored_filename=stored_filename,
+            extension=extension,
+            content_type=file.content_type,
+            size_bytes=len(content),
+        )
+    except StorageError:
+        # Keep files and metadata consistent: no record means no stored file.
+        (UPLOAD_DIR / stored_filename).unlink(missing_ok=True)
+        raise api_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, "Could not store the file."
+        )
+
     return UploadResponse(
         file_id=file_id,
         filename=filename,
@@ -154,3 +249,28 @@ def upload(file: Annotated[UploadFile, File()]) -> UploadResponse:
         size_bytes=len(content),
         status="stored",
     )
+
+
+@app.post("/documents/{document_id}/process")
+def process(document_id: str) -> ProcessResponse:
+    """Extract, normalize and store the text of an uploaded document.
+
+    Runs synchronously: the response is sent when processing has finished.
+    Errors are turned into safe responses by handle_processing_error.
+    """
+    result = process_document(
+        document_id,
+        upload_dir=UPLOAD_DIR,
+        processed_dir=PROCESSED_DIR,
+        db_path=DATABASE_PATH,
+    )
+    return ProcessResponse.from_record(
+        result.record, section_count=len(result.document.sections)
+    )
+
+
+@app.get("/documents/{document_id}")
+def get_document(document_id: str) -> DocumentResponse:
+    """Return a document's metadata and processing status."""
+    record = find_document(document_id, UPLOAD_DIR, DATABASE_PATH)
+    return DocumentResponse.from_record(record)
