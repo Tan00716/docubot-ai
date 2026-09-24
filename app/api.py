@@ -7,9 +7,11 @@ Endpoints:
     GET  /documents/{document_id}         -> processing status and metadata
     POST /documents/{document_id}/chunk   -> split processed text into chunks
     GET  /documents/{document_id}/chunks  -> list the stored chunks
+    POST /documents/{document_id}/embed   -> embed the chunks with the local model
+    GET  /documents/{document_id}/embeddings -> embedding status (no vectors)
 
-Processing and chunking are synchronous. There are NO embeddings, no vector
-search and no RAG yet: chunks are only stored in SQLite.
+Processing, chunking and embedding are synchronous. There is NO vector
+search, no retrieval and no RAG yet: vectors are only stored in SQLite.
 
 Run locally from the project root:
 
@@ -17,10 +19,11 @@ Run locally from the project root:
 """
 
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -52,6 +55,19 @@ from app.document_processing.processor import (
     find_document,
     process_document,
 )
+from app.embeddings.config import EmbeddingConfig
+from app.embeddings.models import (
+    EmbeddingConflictError,
+    EmbeddingContract,
+    EmbeddingDimensionError,
+    EmbeddingError,
+    EmbeddingModelUnavailableError,
+    InvalidEmbeddingConfigError,
+    NoChunksError,
+    UnsupportedEmbeddingModelError,
+)
+from app.embeddings.provider import EmbeddingProvider, FastEmbedProvider
+from app.embeddings.service import embed_document, get_embedding_status
 
 # --- Configuration ----------------------------------------------------------
 
@@ -60,6 +76,7 @@ STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
 UPLOAD_DIR = STORAGE_DIR / "uploads"
 PROCESSED_DIR = STORAGE_DIR / "processed"
 DATABASE_PATH = STORAGE_DIR / "metadata" / "documents.db"
+MODEL_CACHE_DIR = STORAGE_DIR / "model_cache"  # downloaded model files (git-ignored)
 
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_FILENAME_LENGTH = 255
@@ -175,6 +192,46 @@ class ChunkListResponse(ChunkSummaryResponse):
     chunks: list[ChunkResponse]
 
 
+class EmbeddingContractResponse(BaseModel):
+    """Which model produced (or would produce) the vectors. Never the vectors."""
+
+    document_id: str
+    status: str  # "complete", "incomplete" or "no_chunks"
+    model_name: str
+    embedding_version: int
+    dimension: int
+    dtype: str
+    normalized: bool
+    total_chunks: int
+
+    @staticmethod
+    def contract_fields(contract: EmbeddingContract) -> dict:
+        return {
+            "model_name": contract.model_name,
+            "embedding_version": contract.embedding_version,
+            "dimension": contract.dimension,
+            "dtype": contract.dtype,
+            "normalized": contract.normalized,
+        }
+
+
+class EmbedResponse(EmbeddingContractResponse):
+    """Returned after an embedding run."""
+
+    embedded_count: int  # embedded in this run (missing + stale)
+    skipped_count: int  # already had a valid embedding
+    stale_reembedded_count: int  # part of embedded_count that replaced stale vectors
+
+
+class EmbeddingStatusResponse(EmbeddingContractResponse):
+    """Embedding state of a document for the current model contract."""
+
+    embedded_chunks: int
+    missing_embeddings: int
+    stale_embeddings: int
+    truncated_chunks: int  # the model only read the first part of these chunks
+
+
 app = FastAPI(title="DocuBot AI API")
 
 
@@ -204,6 +261,13 @@ PROCESSING_ERROR_STATUS = {
     ProcessedOutputMissingError: status.HTTP_404_NOT_FOUND,
     InvalidChunkingConfigError: status.HTTP_422_UNPROCESSABLE_CONTENT,
     ChunkingConflictError: status.HTTP_409_CONFLICT,
+    InvalidEmbeddingConfigError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    NoChunksError: status.HTTP_409_CONFLICT,
+    EmbeddingConflictError: status.HTTP_409_CONFLICT,
+    EmbeddingModelUnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
+    UnsupportedEmbeddingModelError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    EmbeddingError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    EmbeddingDimensionError: status.HTTP_500_INTERNAL_SERVER_ERROR,
 }
 
 
@@ -391,4 +455,68 @@ def list_chunks(document_id: str, include_text: bool = False) -> ChunkListRespon
         source_filename=record.original_filename,
         file_type=record.extension,
         chunks=[ChunkResponse.from_chunk(c, include_text) for c in chunk_set.chunks],
+    )
+
+
+# --- Embeddings ---------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def get_embedding_provider() -> EmbeddingProvider:
+    """The one embedding provider of this process, created on first use.
+
+    lru_cache keeps the same instance, so the model is loaded once per process
+    and reused by every request. Tests replace it with a small fake model via
+    app.dependency_overrides.
+    """
+    return FastEmbedProvider(EmbeddingConfig(cache_dir=MODEL_CACHE_DIR))
+
+
+@app.post("/documents/{document_id}/embed")
+def embed(
+    document_id: str,
+    provider: Annotated[EmbeddingProvider, Depends(get_embedding_provider)],
+    batch_size: int | None = None,
+) -> EmbedResponse:
+    """Embed a chunked document's chunks with the local model.
+
+    Only chunks without a valid embedding are embedded, so running it again is
+    cheap and never creates duplicates. Vectors are never returned.
+    """
+    summary = embed_document(
+        document_id,
+        upload_dir=UPLOAD_DIR,
+        db_path=DATABASE_PATH,
+        provider=provider,
+        batch_size=batch_size,
+    )
+    return EmbedResponse(
+        document_id=summary.document_id,
+        status="complete",
+        total_chunks=summary.total_chunks,
+        embedded_count=summary.embedded_count,
+        skipped_count=summary.skipped_count,
+        stale_reembedded_count=summary.stale_reembedded_count,
+        **EmbeddingContractResponse.contract_fields(summary.contract),
+    )
+
+
+@app.get("/documents/{document_id}/embeddings")
+def embedding_status(
+    document_id: str,
+    provider: Annotated[EmbeddingProvider, Depends(get_embedding_provider)],
+) -> EmbeddingStatusResponse:
+    """How many chunks have valid, missing or stale embeddings (no vectors)."""
+    result = get_embedding_status(
+        document_id, upload_dir=UPLOAD_DIR, db_path=DATABASE_PATH, contract=provider.contract
+    )
+    return EmbeddingStatusResponse(
+        document_id=result.document_id,
+        status=result.state.value,
+        total_chunks=result.total_chunks,
+        embedded_chunks=result.embedded_chunks,
+        missing_embeddings=result.missing_embeddings,
+        stale_embeddings=result.stale_embeddings,
+        truncated_chunks=result.truncated_chunks,
+        **EmbeddingContractResponse.contract_fields(result.contract),
     )

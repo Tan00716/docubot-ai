@@ -5,9 +5,10 @@ Python (no server, no extra package). Every function opens a short-lived
 connection, so it is safe to call from FastAPI's worker threads.
 
 Tables:
-    documents - one row per uploaded document (processing status lives here)
-    chunks    - the chunks of each document; a document is "chunked" when
-                it has rows here (chunking status is never stored separately)
+    documents  - one row per uploaded document (processing status lives here)
+    chunks     - the chunks of each document; a document is "chunked" when
+                 it has rows here (chunking status is never stored separately)
+    embeddings - one vector per chunk (queries live in app/embeddings/storage.py)
 
 All SQL uses "?" placeholders. Values are never pasted into SQL strings.
 Any sqlite3 error is turned into StorageError (with a safe message).
@@ -75,7 +76,28 @@ CREATE TABLE IF NOT EXISTS chunks (
 )
 """
 
-SCHEMA_STATEMENTS = (DOCUMENTS_SCHEMA, CHUNKS_SCHEMA)
+# One active embedding per chunk (chunk_id is the primary key). vector is a
+# float32 BLOB: dimension * 4 bytes. Deleting a chunk (re-chunking or
+# re-processing) deletes its embedding too (ON DELETE CASCADE), so a vector
+# can never outlive the text it was made from. Queries: app/embeddings/storage.py.
+EMBEDDINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS embeddings (
+    chunk_id          TEXT PRIMARY KEY
+                      REFERENCES chunks (chunk_id) ON DELETE CASCADE,
+    model_name        TEXT NOT NULL,
+    embedding_version INTEGER NOT NULL,
+    dimension         INTEGER NOT NULL CHECK (dimension > 0),
+    dtype             TEXT NOT NULL CHECK (dtype = 'float32'),
+    normalized        INTEGER NOT NULL CHECK (normalized IN (0, 1)),
+    text_sha256       TEXT NOT NULL CHECK (length(text_sha256) = 64),
+    truncated         INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+    vector            BLOB NOT NULL
+                      CHECK (typeof(vector) = 'blob' AND length(vector) = dimension * 4),
+    created_at        TEXT NOT NULL
+)
+"""
+
+SCHEMA_STATEMENTS = (DOCUMENTS_SCHEMA, CHUNKS_SCHEMA, EMBEDDINGS_SCHEMA)
 
 COLUMNS = (
     "document_id, original_filename, stored_filename, extension, content_type, "

@@ -226,3 +226,7 @@ storage/processed/*
 !storage/processed/.gitkeep
 storage/metadata/*
 !storage/metadata/.gitkeep
+
+# DocuBot AI: downloaded embedding model files (hundreds of MB). Never commit them.
+storage/model_cache/*
+!storage/model_cache/.gitkeep
