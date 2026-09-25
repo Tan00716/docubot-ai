@@ -10,7 +10,7 @@ import hashlib
 from pathlib import Path
 
 from app.embeddings.config import VECTOR_DTYPE, EmbeddingConfig
-from app.embeddings.models import EmbeddedText, EmbeddingContract
+from app.embeddings.models import EmbeddedText, EmbeddingContract, QueryTooLongError
 from app.embeddings.vectors import l2_normalize, text_sha256, to_float32
 
 FAKE_MODEL_NAME = "fake/test-model"
@@ -21,6 +21,11 @@ def fake_vector(text: str, dimension: int) -> list[float]:
     """Numbers derived from the text's hash: same text -> same vector."""
     digest = hashlib.sha256(text.encode("utf-8")).digest()
     return [(digest[i % len(digest)] - 127.5) / 127.5 for i in range(dimension)]
+
+
+def fake_token_count(model_input: str) -> int:
+    """Fake "tokens": one per whitespace-separated word, plus 2 special tokens."""
+    return len(model_input.split()) + 2
 
 
 def make_fake_contract(dimension=8, model_name=FAKE_MODEL_NAME, embedding_version=2,
@@ -47,6 +52,8 @@ class FakeEmbeddingProvider:
     - model_inputs records exactly what the "model" was given (prefix included)
     - wrong_passage_prefix simulates a provider bug: it embeds with another
       prefix than the contract says, and reports that input honestly
+    - like the real provider, a question with more than max_tokens fake
+      tokens (see fake_token_count) is rejected with QueryTooLongError
     """
 
     def __init__(self, dimension=8, model_name=FAKE_MODEL_NAME, embedding_version=2,
@@ -94,5 +101,10 @@ class FakeEmbeddingProvider:
 
     def embed_query(self, text):
         model_input = self.contract.query_input(text)
+        if fake_token_count(model_input) > self.contract.max_tokens:
+            raise QueryTooLongError()
         self.model_inputs.append(model_input)
         return self._vector(model_input)
+
+    def count_tokens(self, model_input):
+        return fake_token_count(model_input)

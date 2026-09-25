@@ -3,9 +3,10 @@
     validate query + top_k (+ document_id)
     -> load candidates whose vectors are VALID for the current contract
     -> nothing to search? return no results (the model is not even loaded)
-    -> embed the question once ("query: " + question, same model and contract)
+    -> embed the question once ("query: " + question, same model and contract);
+       a question longer than the model's token limit is rejected, not cut
     -> check every vector, score all candidates at once (cosine = dot product)
-    -> rank: score DESC, then chunk_id ASC -> keep the best top_k
+    -> rank: full-precision score DESC, then chunk_id ASC -> keep the best top_k
 
 "Exact" (brute force) means every candidate is compared with the query:
 about N x D multiplications for N chunks of D numbers. This is correct and
@@ -30,7 +31,6 @@ from app.embeddings.storage import CORRUPTED_EMBEDDINGS_MESSAGE
 from app.search import storage
 from app.search.models import (
     DEFAULT_TOP_K,
-    SCORE_DECIMALS,
     InvalidQueryVectorError,
     SearchCandidate,
     SearchNotSupportedError,
@@ -54,15 +54,16 @@ UNEXPECTED_SEARCH_ERROR_MESSAGE = "Unexpected error while searching."
 def rank_top_k(scores: Sequence[float], chunk_ids: Sequence[str], top_k: int) -> list[int]:
     """Positions of the best top_k candidates, best first (pure function).
 
-    Order: higher score first; equal scores -> smaller chunk_id first. The
-    order therefore never depends on how the database returned the rows.
-    Scores are compared after rounding to SCORE_DECIMALS, so two chunks whose
-    scores differ only by float32 noise count as a tie and are ordered by ID.
+    Order: higher score first; exactly equal scores -> smaller chunk_id first.
+    The order therefore never depends on how the database returned the rows.
+    Scores are compared at FULL precision: 0.9123456 ranks above 0.9123451
+    even though both would be displayed as 0.912346 / 0.912345 or even the
+    same rounded value. Rounding is only for display (the API response).
     """
     if len(scores) != len(chunk_ids):
         raise ValueError("Every score needs exactly one chunk_id.")
-    rounded = [round(float(score), SCORE_DECIMALS) for score in scores]
-    order = sorted(range(len(rounded)), key=lambda i: (-rounded[i], chunk_ids[i]))
+    exact = [float(score) for score in scores]
+    order = sorted(range(len(exact)), key=lambda i: (-exact[i], chunk_ids[i]))
     return order[:top_k]
 
 
@@ -135,7 +136,7 @@ def search(
     results = tuple(
         SearchResult(
             rank=rank,
-            score=round(scores[index], SCORE_DECIMALS),
+            score=scores[index],  # full precision; the API rounds it for display
             chunk=candidates[index].chunk,
             truncated=candidates[index].truncated,
         )

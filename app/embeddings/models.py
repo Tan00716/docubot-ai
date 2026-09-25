@@ -192,6 +192,20 @@ class EmbeddingDimensionError(EmbeddingError):
     safe_message = "The embedding model returned a vector with an unexpected dimension."
 
 
+class QueryTooLongError(ProcessingError):
+    """The question has more tokens than the model reads ("query: " prefix included).
+
+    Documents may be truncated (their chunk is marked truncated=True), but a
+    question is never silently cut: the caller would believe the whole
+    question was searched when the model only saw its beginning.
+    """
+
+    safe_message = (
+        "query is too long for the embedding model: it reads at most 512 tokens "
+        "(the 'query: ' prefix included). Please shorten the question."
+    )
+
+
 class EmbeddingConflictError(ProcessingError):
     """The chunks changed (re-chunked or re-processed) while embedding."""
 

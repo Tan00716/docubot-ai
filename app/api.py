@@ -67,6 +67,7 @@ from app.embeddings.models import (
     EmbeddingModelUnavailableError,
     InvalidEmbeddingConfigError,
     NoChunksError,
+    QueryTooLongError,
     UnsupportedEmbeddingModelError,
 )
 from app.embeddings.provider import EmbeddingProvider, FastEmbedProvider
@@ -75,6 +76,7 @@ from app.search.models import (
     DEFAULT_TOP_K,
     MAX_QUERY_LENGTH,
     MAX_TOP_K,
+    SCORE_DECIMALS,
     InvalidQueryVectorError,
     InvalidSearchQueryError,
     InvalidTopKError,
@@ -292,7 +294,7 @@ class SearchResultResponse(BaseModel):
     """One ranked chunk. The vector itself is never returned."""
 
     rank: int  # 1 = most similar
-    score: float  # cosine similarity from -1 to 1 (not a probability)
+    score: float  # cosine similarity from -1 to 1 (not a probability), rounded for display
     chunk_id: str
     document_id: str
     chunk_index: int
@@ -306,7 +308,8 @@ class SearchResultResponse(BaseModel):
         chunk = result.chunk
         return cls(
             rank=result.rank,
-            score=result.score,
+            # Rounded here, at serialization only: the ranking used the exact score.
+            score=round(result.score, SCORE_DECIMALS),
             chunk_id=chunk.chunk_id,
             document_id=chunk.document_id,
             chunk_index=chunk.chunk_index,
@@ -363,6 +366,7 @@ PROCESSING_ERROR_STATUS = {
     EmbeddingDimensionError: status.HTTP_500_INTERNAL_SERVER_ERROR,
     InvalidSearchQueryError: status.HTTP_422_UNPROCESSABLE_CONTENT,
     InvalidTopKError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    QueryTooLongError: status.HTTP_422_UNPROCESSABLE_CONTENT,
     SearchNotSupportedError: status.HTTP_500_INTERNAL_SERVER_ERROR,
     InvalidQueryVectorError: status.HTTP_500_INTERNAL_SERVER_ERROR,
 }
@@ -632,6 +636,8 @@ def vector_search(
     The question is embedded as "query: <question>" with the same local model
     that embedded the chunks, then compared with every chunk vector that is
     valid for the current embedding contract (stale vectors are ignored).
+    A question longer than the model's token limit (512 tokens including
+    the prefix) is rejected with 422 instead of being silently cut.
     Results are ranked by score (highest first), ties by chunk_id. Nothing
     is stored: not the question, not the query vector. Vectors are never returned.
     """

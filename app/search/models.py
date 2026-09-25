@@ -13,12 +13,15 @@ DEFAULT_TOP_K = 5
 # Upper limit for top_k: a caller cannot ask for (and make the server sort
 # and serialize) an unbounded number of chunks.
 MAX_TOP_K = 50
-# Longest accepted question, in characters. The model itself only reads the
-# first 512 tokens ("query: " prefix included); this limit keeps huge inputs
-# away from the tokenizer and the hashing/logging code.
+# Longest accepted question, in characters: a cheap first bound that keeps
+# huge inputs away from the tokenizer. The REAL limit is the model's token
+# limit (512 tokens, "query: " prefix included), checked with the model's own
+# tokenizer when the question is embedded: a longer question is rejected
+# (QueryTooLongError) instead of being silently cut. 4000 characters can be
+# more than 512 tokens (Chinese text is roughly 1.5 characters per token).
 MAX_QUERY_LENGTH = 4000
-# Scores are rounded to this many decimals, both for the ranking and for the
-# response. float32 vectors cannot tell scores apart beyond about 1e-6.
+# Scores are rounded to this many decimals ONLY in the API response. Ranking
+# always uses the full-precision score (see service.rank_top_k).
 SCORE_DECIMALS = 6
 
 
@@ -36,7 +39,7 @@ class SearchResult:
     """One ranked search hit (no vector: it never leaves the search layer)."""
 
     rank: int  # 1 = most similar
-    score: float  # cosine similarity, rounded to SCORE_DECIMALS
+    score: float  # cosine similarity at full precision (rounded only by the API)
     chunk: Chunk
     truncated: bool
 

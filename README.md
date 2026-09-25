@@ -41,8 +41,13 @@ Production-oriented RAG Telegram knowledge assistant
 **Vector search** ([app/search/](app/search/))
 
 - Exact brute-force cosine similarity (NumPy dot product of unit vectors), only over vectors valid for the current contract
-- Deterministic ranking (score, then `chunk_id`), `top_k` 1–50, read-only, never returns vectors
-- A small hand-labelled retrieval baseline (Recall@1/3/5) for later comparison
+- Deterministic ranking (full-precision score, then `chunk_id`), `top_k` 1–50, read-only, never returns vectors
+- Questions longer than the model's 512-token limit are rejected (`422`), never silently cut
+
+**Retrieval evaluation** ([app/evaluation/](app/evaluation/))
+
+- A development evaluation set: 42 passages (English, Chinese, mixed), 33 questions with evidence-based labels
+- Recall@1/3/5 and MRR per language direction, truncation analysis, chunk-size experiment ([Retrieval Evaluation](#retrieval-evaluation))
 
 The Telegram bot and the web API are two **separate programs**. They are not
 connected to each other yet.
@@ -338,7 +343,7 @@ Request (JSON body):
 
 | Field | Rules |
 |---|---|
-| `query` | Required text, 1–4000 characters; surrounding whitespace is removed and it must not be blank |
+| `query` | Required text, 1–4000 characters; surrounding whitespace is removed and it must not be blank. It must also fit into the model's **512 tokens** (`query: ` prefix and special tokens included), measured with the model's own tokenizer |
 | `top_k` | Optional whole number from 1 to 50 (default 5); `"5"`, `5.0` and `true` are rejected |
 | `document_id` | Optional; search only this document. Omit it to search all documents |
 
@@ -367,7 +372,8 @@ Success — `200 OK` (best result first; the vectors themselves are never return
 }
 ```
 
-- `score` is the cosine similarity (−1 to 1, rounded to 6 decimals). It is a
+- `score` is the cosine similarity (−1 to 1), **rounded to 6 decimals for display
+  only**: the ranking itself used the full-precision score. It is a
   **relative** number for ranking, not a probability and not a "confidence".
 - `truncated: true` means the model only read the first 512 tokens of this
   chunk (see [Embedding limitations](#embedding-limitations)).
@@ -385,6 +391,7 @@ Errors:
 | `400 Bad Request` | `document_id` is not a valid document ID (`{"detail": "Invalid document ID."}`) |
 | `404 Not Found` | No document with this `document_id` |
 | `422 Unprocessable Content` | Invalid JSON, missing/blank/too long `query`, `top_k` outside 1–50 or not a whole number, unknown fields (FastAPI's standard validation format) |
+| `422 Unprocessable Content` | `query` has more than 512 tokens: `{"detail": "query is too long for the embedding model: it reads at most 512 tokens (the 'query: ' prefix included). Please shorten the question."}` |
 | `503 Service Unavailable` | The model could not be loaded |
 | `500 Internal Server Error` | A stored vector is corrupted, the model returned an invalid query vector, the database could not be read, or an unexpected error happened (only a short safe message, never internal details) |
 
@@ -940,10 +947,35 @@ API 层只负责 HTTP，service 负责流程，storage 负责读数据，similar
 
 ### Ranking（排序）是确定的
 
-同样的数据库 + 同样的问题 → 同样的结果顺序。排序规则：先 `score` 从高到低，分数相同时按
-`chunk_id` 从小到大，从不依赖 SQLite 返回行的顺序。分数先四舍五入到 6 位小数再排序：
-float32 向量本身区分不了更小的差别，这样只差"浮点噪声"的两个 chunk 被视为同分，
-按 chunk_id 排，顺序也和响应里看到的分数一致。
+同样的数据库 + 同样的问题 → 同样的结果顺序。排序规则：先 `score` 从高到低，分数**完全相同**时按
+`chunk_id` 从小到大，从不依赖 SQLite 返回行的顺序。
+
+**Full precision（完整精度）排序**（Batch 6A 修正）：排序使用完整精度的分数，**只在 API 响应里**
+四舍五入到 6 位小数。例如 0.91234549 和 0.91234512 显示时都是 `0.912345`，但它们并不相等，
+排序时前者在前。Batch 6 曾经先四舍五入再排序，这样两个不同的分数会被当成"同分"，改由
+chunk_id 决定顺序——显示值不应该影响排序。所以响应里两个相邻结果可能显示相同的分数，
+但顺序仍然是由真实分数决定的。
+
+### Query token limit（问题长度上限）
+
+模型最多读取 **512 tokens**（包括 `query: ` 前缀和开头/结尾的特殊 token）。**Token**（词元）
+→ 分词器切出来的最小单位 → 例如英文单词 "search" 通常是 1 个 token，中文大约 1.5 个字符一个 token。
+
+| 情况 | 行为 |
+|---|---|
+| 短问题 | 正常搜索 |
+| 接近上限（刚好 512 tokens） | 正常搜索 |
+| 超过上限（513 tokens 及以上） | `422`，提示缩短问题；模型不会计算这个问题的向量 |
+
+- 用的是**模型自己的 tokenizer**（已经加载好的那一个，不会再加载一次模型），不是"字符数 × 比例"的估算。
+  判断依据是 tokenizer 的 `overflowing`：它不为空，就说明模型会截断输入。
+- 为什么拒绝而不是截断：document chunk 被截断时会标记 `truncated: true`，用户能看到；但如果问题被悄悄
+  截断，用户会以为整个问题都被搜索了，实际上模型只看到了开头。
+- 4000 字符的限制仍然保留，作为便宜的第一道边界（在进入 tokenizer 之前就拒绝超大输入）。
+  4000 个中文字符远远超过 512 tokens，所以对中文来说，真正起作用的是 token 上限。
+- 只有问题真正被 embed 时才检查 token 数。如果数据库里没有可搜索的 chunk，问题根本不会被 embed
+  （模型都不加载），这时返回 `200` 和空结果——这是有意的、已测试的行为。
+- Chunking 没有为此改变：chunk 的截断仍然只是标记，不会被拒绝。
 
 ### 为什么现在用 exact brute-force，而不用 Qdrant / FAISS
 
@@ -995,6 +1027,183 @@ PostgreSQL），8 个问题（英文、中文，以及 1 个"中文问题 → �
 - 它的用途是给以后的 batch（chunking 策略、reranking、换模型）提供一个固定的对比起点。
 - 测试里设置了远低于当前值的下限（Recall@1 ≥ 0.6、@3 ≥ 0.8、@5 ≥ 0.9），只用来发现
   "流水线坏了"（例如前缀用反），不是质量目标。
+- Batch 6A 用一个更大的评估集取代了它作为主要依据（见下一节）；这个小基线和它的测试保留不变。
+
+### Retrieval Evaluation
+
+> **These metrics are a development evaluation set, not a general benchmark.**
+> 这些数字只描述"当前模型 + 当前 chunking + exact search 在这 33 个问题上的表现"，
+> 不代表一般的多语言检索能力，也不是生产环境的质量证明。
+
+**为什么要评估 retrieval（检索）？** RAG 的答案只能建立在检索到的证据上。如果正确的 chunk 根本没被找到，
+后面的 LLM 再好也答不对。所以在做 RAG 之前，先单独回答："正确的证据能不能被稳定地找到？"
+
+#### 指标
+
+**Recall@K（前 K 召回率）** → 相关证据有没有出现在前 K 个结果里 → 一个问题只有一个相关证据时，
+就是 1（在前 K 里）或 0（不在）。如果一个问题有 2 个相关证据、前 K 里只找到 1 个，Recall@K = 0.5。
+分母是**相关证据的个数**，不是 chunk 的个数：chunk overlap 可能把同一句证据复制到两个 chunk 里，
+找到其中任何一个都只算找到这一个证据一次。
+
+**MRR（Mean Reciprocal Rank，平均倒数排名）** → 第一个相关结果排得有多靠前：
+
+| 第一个相关结果的排名 | 这个问题的贡献 |
+|---|---|
+| 1 | 1.0 |
+| 2 | 0.5 |
+| 4 | 0.25 |
+| 没有被返回（前 50 名里没有） | 0 |
+
+MRR 是所有问题的平均值。它比 Recall@5 更敏感：排第 1 和排第 4 在 Recall@5 里一样，在 MRR 里差 4 倍。
+这很重要，因为以后 RAG 通常只把前几个 chunk 交给 LLM。
+
+#### Golden dataset（标准答案数据集）
+
+代码在 [app/evaluation/](app/evaluation/)：
+
+| 文件 | 作用 |
+|---|---|
+| [corpus.py](app/evaluation/corpus.py) | 42 段手写的文本（17 英文、18 中文、7 中英混合），每段作为一个 `.txt` 文档上传 |
+| [golden.py](app/evaluation/golden.py) | 33 个问题 + 相关证据（relevant）+ 可接受的次要证据（secondary） |
+| [metrics.py](app/evaluation/metrics.py) | Recall@K、MRR（纯函数） |
+| [runner.py](app/evaluation/runner.py) | 走**真实的流水线**：process → chunk → embed → `app.search.service.search()` |
+| [analysis.py](app/evaluation/analysis.py) / [report.py](app/evaluation/report.py) | token 统计、截断分析、诊断、报告 |
+
+- 内容都是 DocuBot 相关的技术主题（SQLite、FastAPI、Telegram、Docker、embedding、chunking、RAG……），
+  并且故意放入**相似但答案不同**的干扰段落：SQLite WAL / SQLite 单文件 / PostgreSQL，400 / 422 / 404，
+  long polling / webhook，exact search / ANN index 等。
+- 长度有短、中、长；有接近 512 tokens 边界的中文段落；还有一个很长的中文 FAQ，把不相关的话题放在同一个文档里
+  （真实上传的文档经常是这样）。
+- 标签**不是 chunk ID**，而是"段落 + 一句证据原文"。chunk 大小改变后，包含这句证据的 chunk 自动成为相关 chunk，
+  所以同一套标签可以用于所有 chunk size。如果某句证据被切在两个 chunk 之间、哪个 chunk 都不完整包含它，
+  runner 会直接报错，而不是悄悄少算一个标签。
+- 问题避免照抄答案的措辞：测试检查问题和答案段落共享的最长片段不超过 16 个字符（实测最大 13，
+  都是 "long polling"、"FastAPI" 这类专有名词）。
+- 方向（direction）= "问题语言 → 答案语言"。`mixed` = 中文句子里有很多英文技术词。
+
+#### 当前结果（1200 / 200，`multilingual-e5-small`，2026-09-25）
+
+| Direction | Queries | R@1 | R@3 | R@5 | MRR |
+|---|---|---|---|---|---|
+| **all** | 33 | 0.455 | 0.606 | 0.667 | 0.555 |
+| en → en | 5 | 0.800 | 1.000 | 1.000 | 0.900 |
+| zh → zh | 9 | 0.778 | 0.778 | 0.889 | 0.810 |
+| zh → en | 5 | 0.000 | 0.000 | 0.000 | 0.049 |
+| en → zh | 5 | 0.000 | 0.000 | 0.200 | 0.108 |
+| mixed → en | 3 | 0.333 | 0.667 | 0.667 | 0.468 |
+| mixed → zh | 3 | 0.667 | 1.000 | 1.000 | 0.778 |
+| zh → mixed | 1 | 0.000 | 1.000 | 1.000 | 0.500 |
+| en → mixed | 1 | 1.000 | 1.000 | 1.000 | 1.000 |
+| mixed → mixed | 1 | 0.000 | 1.000 | 1.000 | 0.500 |
+
+**跨语言诊断**（第一个相关 chunk 的排名）：
+
+| Direction | 每个问题的排名 | 前 5 个结果里和问题同语言的比例 |
+|---|---|---|
+| en → en | 1, 1, 1, 1, 2 | 24/25 |
+| zh → zh | 1, 1, 1, 1, 1, 1, 1, 11, 5 | 41/45 |
+| zh → en | 20, 19, 28, 23, 16 | 20/25 |
+| en → zh | 4, 14, 17, 20, 9 | 23/25 |
+
+在这个数据集上，**同语言检索可靠，跨语言检索明显更弱**：中文问题的前 5 名大多是（相关主题的）中文段落，
+正确的英文段落排在第 16–28 位；反过来也一样。这和 Batch 6 那 1 个例子方向一致，但现在有 10 个跨语言问题、
+多个主题的证据。仍然要注意：每个方向只有 5 个问题，而且语料里每个主题都有同语言的相近段落
+（这会放大"同语言优先"的效果）。所以结论是"**在这个语料上跨语言更弱**"，不是"这个模型的跨语言能力普遍很差"。
+
+#### Token 与截断分析
+
+用模型自己的 tokenizer 测量（`passage: ` 前缀和特殊 token 都算在内），取每种语言语料的前 N 个字符：
+
+| 语言 | 600 字符 | 800 字符 | 1000 字符 | 1200 字符 | 平均每 token 字符数 | 能被完整读取的最大长度 |
+|---|---|---|---|---|---|---|
+| English | 145 | 191 | 233 | 277 | 4.31 | 约 2170 字符 |
+| 中文 | 387 | **519** | **642** | **772** | 1.50 | 约 790 字符 |
+| mixed | 273 | 372 | 476 | **577** | 2.10 | 约 1060 字符 |
+
+（粗体 = 超过 512 tokens，模型读不到后面的部分。）
+
+- 英文 chunk 在 1200 字符时只用到约 280 tokens，**从来不会被截断**。
+- 纯中文大约 **790 个字符**就达到 512 tokens。1200 字符的中文 chunk 大约有 1/3 的内容模型看不到。
+- 在评估集里（段落都比较短），1200/200 时有 4/18 个中文 chunk 被截断，英文和混合都是 0。
+  **真实上传的长中文文档**会被打包成接近 1200 字符的 chunk，被截断的比例会高得多。
+
+**截断对检索的影响**（按"模型有没有读到证据"分组）。所有问题一起比较会被跨语言失败干扰
+（它们几乎都在"未截断"组），所以下面只比较同语言问题（en→en、zh→zh）：
+
+| 相关 chunk（1200/200） | Queries | R@1 | R@3 | R@5 | MRR |
+|---|---|---|---|---|---|
+| 未截断 | 9 | 0.889 | 1.000 | 1.000 | 0.944 |
+| 截断，但证据在 512 tokens 窗口内 | 1 | 1.000 | 1.000 | 1.000 | 1.000 |
+| 截断，证据在窗口之外 | 4 | 0.500 | 0.500 | 0.750 | 0.573 |
+
+证据在窗口之外的 4 个问题里，有 2 个仍然排第 1：这两段文字开头的主题和问题一样，模型虽然没读到答案句，
+仍然能凭主题找到这一段。另外 2 个（长 FAQ 里靠后的问题：文件存在哪里、能否在 Telegram 提问）排第 11 和第 5：
+FAQ 可见的前半部分讲的是别的话题。也就是说，**截断主要伤害"一个 chunk 里有多个话题、答案在后面"的情况**。
+样本只有 4 个问题，这是一个有依据的信号，不是精确的数值。
+
+#### Chunk size 实验（离线，不改变生产默认值）
+
+同一个语料、同一套标签、同一个模型：
+
+| Chunk size | Overlap | Chunks | 平均字符 | 最大 tokens | 截断数 (en/zh/mixed) | R@1 | R@3 | R@5 | MRR |
+|---|---|---|---|---|---|---|---|---|---|
+| **1200** | **200** | 42 | 361 | 650 | 4 (0/4/0) | 0.455 | 0.606 | 0.667 | 0.555 |
+| 800 | 100 | 48 | 320 | 573 | 1 (0/1/0) | 0.455 | 0.606 | 0.667 | 0.559 |
+| 600 | 100 | 51 | 302 | 430 | 0 | 0.455 | 0.545 | 0.667 | 0.552 |
+| 400 | 50 | 65 | 242 | 276 | 0 | 0.485 | 0.606 | 0.667 | 0.561 |
+
+整体数字几乎不变（一个问题 = 0.03，差别都在一个问题以内）。逐个问题看：
+
+| 问题 | @1200 | @800 | @600 | @400 |
+|---|---|---|---|---|
+| FAQ：文件存在哪里（证据在窗口外） | 11 | 11 | 7 | 3 |
+| FAQ：能否在 Telegram 提问（证据在窗口外） | 5 | 2 | 2 | 1 |
+| 为什么中文更快用完 token 上限（en→zh） | 9 | 10 | 6 | 18 |
+| log 能不能记录原始问题（mixed→zh） | 1 | 2 | 4 | 2 |
+
+更小的 chunk 能救回"证据被截断"的问题，但也让另一些问题变差，总体持平。
+**决定整体数字的是跨语言失败，而 chunk size 修不好它。**
+
+#### 确定性与性能
+
+- 同一个评估在两个独立构建的临时数据库上运行（也在两个独立进程中运行）：排名、完整精度的分数、
+  标签判断**完全相同**。`fingerprint` 比较的是原始分数，不是四舍五入后的数字。
+- 性能（Intel i5-1334U 笔记本，CPU，模型已缓存；这台机器的计时波动很大，同一配置两次测量相差可达 2 倍）：
+  42 个 chunk、33 个问题；embedding 全部 chunk 约 5.5–10.5 s；每次搜索（包括把问题变成向量）
+  平均约 37–42 ms，最慢约 65–105 ms；整个报告（4 种配置 + 1 次重复 + token 分析）约 70 s。
+
+#### 如何运行
+
+```powershell
+# 完整报告（Markdown 输出到终端；需要模型已缓存；强制离线，不写任何文件）
+.venv\Scripts\python.exe -m app.evaluation.report
+
+# 真实模型评估测试（opt-in）
+$env:DOCUBOT_RUN_MODEL_SMOKE_TEST = "1"
+.venv\Scripts\python.exe -m unittest discover -s tests -p "test_retrieval_evaluation_model.py" -v
+```
+
+所有知识库都建在临时文件夹里，结束后删除；项目自己的 `storage/` 数据库不会被读写（只读取模型缓存）。
+
+#### Limitations（局限）
+
+- 33 个问题、42 段文字：每个方向 1–9 个问题，一个问题就能让 Recall 变化 0.1–0.2。
+- 问题和标签由同一个人（AI 辅助）编写，可能带有偏见；没有第二个人独立标注。
+- 语料是短段落，每段一个文档；真实文档更长、结构更复杂。
+- 只评估了一个 embedding 模型；没有和其他模型比较，所以不能说"这个模型好/不好"，只能说"在这里表现如何"。
+- 只看检索，不评估答案生成。
+- 回归测试里的下限（整体 R@5 ≥ 0.55，同语言 R@5 ≥ 0.80）远低于实测值，只用来发现流水线损坏，不是质量目标。
+
+#### Decision record：生产 chunking
+
+| | |
+|---|---|
+| **决定** | **KEEP 1200 / 200**（DEFER 任何修改） |
+| **日期** | 2026-09-25（Batch 6A） |
+| **依据** | ① 800/100、600/100、400/50 的整体指标与 1200/200 相差不超过一个问题；② 更小的 chunk 改善了 2 个"证据被截断"的问题，但让另外 2 个问题变差；③ 最大的失败来源是跨语言检索（10 个问题，R@5 = 0.10），与 chunk size 无关；④ 修改 chunk 参数会让所有已有 embeddings 失效。 |
+| **已知风险** | 纯中文超过约 790 字符就会被截断；长中文文档（尤其是 FAQ 这类多话题文档）后面的内容可能检索不到。 |
+| **以后可能的方向** | 按 token 而不是字符限制 chunk 大小，或者按语言设置不同的 chunk size（选项 C）——需要先用**更多长中文文档**评估（选项 D），证明它确实有帮助。 |
+| **不是的结论** | 这不是"1200 是最优值"的证明；只是现有证据不足以支持修改。 |
 
 ### Current limitations
 
@@ -1004,8 +1213,8 @@ PostgreSQL），8 个问题（英文、中文，以及 1 个"中文问题 → �
   纯中文 chunk 可能超过 512 tokens，模型只读到前面约 750–800 个字符，后面的内容不影响向量，
   所以这类 chunk 的检索质量可能受影响（结果里 `truncated: true`）。本 batch 没有修改 chunk_size /
   chunk_overlap / chunk ID；以后通过检索评估和 chunking 策略再研究。
-- 问题同样最多读 512 tokens（包括 `query: `），更长的部分被模型忽略。
-- 跨语言检索在 baseline 里明显弱于同语言检索（见上）。
+- 超过 512 tokens 的问题会被拒绝（`422`），不再被悄悄截断（见 [Query token limit](#query-token-limit问题长度上限)）。
+- 在开发评估集上，跨语言检索明显弱于同语言检索（见 [Retrieval Evaluation](#retrieval-evaluation)）。
 - **No reranking, no hybrid search**（没有 BM25 / 关键词检索），没有 metadata filter（只有 `document_id`）。
 - **No vector database / vector index**。
 - **No RAG answer generation**：搜索只返回相关的 chunk，不生成答案，也不生成引用。
@@ -1079,6 +1288,12 @@ retrieval baseline (Recall@1/3/5 printed to the console) run like this:
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -s tests -p "test_search_smoke.py" -v
 ```
+
+The retrieval evaluation has fast offline tests (metrics, golden labels, the
+runner on the real pipeline with the fake model, query token limit, full-precision
+ranking) that run in the normal suite, and an opt-in real-model test
+([tests/test_retrieval_evaluation_model.py](tests/test_retrieval_evaluation_model.py));
+see [Retrieval Evaluation](#retrieval-evaluation) for the report command.
 
 Search ranking itself is tested with hand-made unit vectors (not a model),
 so a broken similarity or sorting step always fails a test

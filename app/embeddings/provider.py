@@ -1,6 +1,6 @@
 """The local embedding model (FastEmbed + ONNX Runtime on the CPU).
 
-This is the ONLY module that imports fastembed or huggingface_hub.
+This is the ONLY module that imports fastembed, tokenizers or huggingface_hub.
 Everything outside it works with plain Python tuples of floats, so the model
 can be replaced later without touching storage or the API.
 
@@ -25,6 +25,7 @@ from typing import Any, Protocol
 from fastembed import TextEmbedding
 from fastembed.common.model_description import ModelSource, PoolingType
 from huggingface_hub import snapshot_download
+from tokenizers import Tokenizer
 
 from app.embeddings.config import (
     VECTOR_DTYPE,
@@ -39,6 +40,7 @@ from app.embeddings.models import (
     EmbeddingError,
     EmbeddingModelMismatchError,
     EmbeddingModelUnavailableError,
+    QueryTooLongError,
     UnsupportedEmbeddingModelError,
 )
 from app.embeddings.vectors import l2_normalize, text_sha256, to_float32
@@ -185,13 +187,18 @@ class FastEmbedProvider:
         self.spec = get_model_spec(config.model_name)
         self.contract = build_contract(config)
         self._model: TextEmbedding | None = None
+        self._counting_tokenizer: Tokenizer | None = None  # see count_tokens()
         self._load_lock = threading.Lock()  # two requests must not load it twice
 
     def _get_model(self) -> TextEmbedding:
         with self._load_lock:
-            if self._model is None:
-                self._model = self._load_model()
-            return self._model
+            return self._get_model_unlocked()
+
+    def _get_model_unlocked(self) -> TextEmbedding:
+        # The caller must hold self._load_lock (threading.Lock is not re-entrant).
+        if self._model is None:
+            self._model = self._load_model()
+        return self._model
 
     def _load_model(self) -> TextEmbedding:
         _register_model(self.spec)
@@ -237,16 +244,46 @@ class FastEmbedProvider:
 
         model.embed() is used for both kinds of text, so the only prefix is
         the one added here (FastEmbed adds none for custom models).
+
+        Token limit policy: the question is measured with the model's own
+        (already loaded) tokenizer. Up to max_tokens tokens, prefix and
+        special tokens included, it is embedded; one token more raises
+        QueryTooLongError. The model would otherwise silently ignore the rest.
         """
         _check_texts([text])
         model = self._get_model()
+        model_input = self.contract.query_input(text)
         try:
-            values = next(iter(model.embed([self.contract.query_input(text)], batch_size=1)))
+            too_long = _is_truncated(model, model_input)
+        except Exception as error:
+            logger.error("Tokenizer failed: %s", type(error).__name__)
+            raise EmbeddingError()
+        if too_long:
+            # Only the fact is logged, never the question itself.
+            logger.info("Rejected a search query longer than %d tokens", self.contract.max_tokens)
+            raise QueryTooLongError()
+        try:
+            values = next(iter(model.embed([model_input], batch_size=1)))
             values = values.tolist()
         except Exception as error:
             logger.error("Embedding model failed: %s", type(error).__name__)
             raise EmbeddingError()
         return self._finish(values)
+
+    def count_tokens(self, model_input: str) -> int:
+        """How many tokens the model input has BEFORE the max_tokens cut (for analysis).
+
+        model_input must already contain its prefix ("passage: " or "query: ").
+        The loaded tokenizer cuts every input at max_tokens, so it cannot say
+        how long a text really is. This uses a copy of that same tokenizer
+        with the cut switched off (made once from the loaded model, the model
+        itself is not loaded again). It never changes what gets embedded.
+        """
+        with self._load_lock:
+            if self._counting_tokenizer is None:
+                self._counting_tokenizer = _untruncated_copy(self._get_model_unlocked())
+            tokenizer = self._counting_tokenizer
+        return len(tokenizer.encode(model_input).ids)
 
     def _finish(self, values: list[float]) -> tuple[float, ...]:
         """Check the size, normalize if configured, round to float32."""
@@ -268,3 +305,15 @@ def _is_truncated(model: Any, model_input: str) -> bool:
     reports the cut-off part as "overflowing".
     """
     return bool(model.model.tokenizer.encode(model_input).overflowing)
+
+
+def _untruncated_copy(model: Any) -> Tokenizer:
+    """An independent copy of the model's tokenizer that never cuts or pads.
+
+    Built from the loaded tokenizer's own JSON, so the vocabulary and rules
+    are exactly the ones the model uses. The original is left untouched.
+    """
+    copy = Tokenizer.from_str(model.model.tokenizer.to_str())
+    copy.no_truncation()
+    copy.no_padding()
+    return copy

@@ -246,10 +246,29 @@ class RankingTests(unittest.TestCase):
                 order = service.rank_top_k([scores[i] for i in ids], ids, top_k=5)
                 self.assertEqual([ids[i] for i in order], expected)
 
-    def test_float32_noise_counts_as_a_tie(self):
+    def test_tiny_score_differences_are_not_treated_as_ties(self):
+        # Batch 6A: ranking uses the full-precision score. (Batch 6 rounded to
+        # 6 decimals first, which made these two a "tie" ordered by chunk_id.)
         order = service.rank_top_k([0.5 + 1e-9, 0.5], ["b", "a"], top_k=2)
 
-        self.assertEqual(order, [1, 0])
+        self.assertEqual(order, [0, 1])
+
+    def test_scores_that_round_to_the_same_value_keep_their_exact_order(self):
+        # Both display as 0.912346 at 6 decimals; "a" would win a rounded tie.
+        scores = [0.9123455, 0.9123460]
+
+        self.assertEqual(round(scores[0], 6), round(scores[1], 6))
+        self.assertEqual(service.rank_top_k(scores, ["a", "b"], top_k=2), [1, 0])
+
+    def test_close_scores_from_the_spec_example_stay_in_order(self):
+        scores = [0.912345103, 0.912345612]
+
+        self.assertEqual(service.rank_top_k(scores, ["a", "b"], top_k=2), [1, 0])
+
+    def test_only_exactly_equal_scores_fall_back_to_chunk_id(self):
+        order = service.rank_top_k([0.7, 0.7, 0.7 - 1e-12], ["z", "m", "a"], top_k=3)
+
+        self.assertEqual(order, [1, 0, 2])
 
     def test_only_top_k_are_returned(self):
         self.assertEqual(service.rank_top_k([0.1, 0.9, 0.5], ["a", "b", "c"], top_k=2), [1, 2])
