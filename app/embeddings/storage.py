@@ -54,8 +54,11 @@ ON CONFLICT (chunk_id) DO UPDATE SET
 """
 
 
-def _to_record(row: tuple) -> EmbeddingRecord:
-    """Turn a database row into an EmbeddingRecord, checking every type."""
+def to_embedding_record(row: tuple) -> EmbeddingRecord:
+    """Turn a database row (RECORD_COLUMNS) into an EmbeddingRecord, checking every type.
+
+    Raises ValueError for corrupted rows. Also used by app/search/storage.py.
+    """
     (chunk_id, model_name, revision, version, dimension, max_tokens, prefix, dtype,
      normalized, sha, input_sha, truncated, created) = row
     texts = (chunk_id, model_name, revision, prefix, dtype, sha, input_sha, created)
@@ -90,7 +93,7 @@ def get_embedding_records(db_path: Path, document_id: str) -> dict[str, Embeddin
             (document_id,),
         ).fetchall()
     try:
-        records = [_to_record(row) for row in rows]
+        records = [to_embedding_record(row) for row in rows]
     except ValueError as error:
         logger.error("Corrupted embedding metadata for %s: %s", document_id, type(error).__name__)
         raise StorageError(CORRUPTED_EMBEDDINGS_MESSAGE)
@@ -107,7 +110,7 @@ def get_embedding(db_path: Path, chunk_id: str) -> StoredEmbedding | None:
     if row is None:
         return None
     try:
-        record = _to_record(row[:-1])
+        record = to_embedding_record(row[:-1])
         vector = deserialize_vector(row[-1], record.dimension)
     except ValueError as error:
         logger.error("Corrupted embedding for chunk %s: %s", chunk_id, type(error).__name__)

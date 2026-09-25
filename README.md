@@ -1,11 +1,11 @@
 # docubot-ai
 Production-oriented RAG Telegram knowledge assistant
 
-> **Current status: Telegram Bot MVP + FastAPI file upload + document processing + chunking + local embeddings.**
+> **Current status: Telegram Bot MVP + FastAPI file upload + document processing + chunking + local embeddings + exact vector search.**
 > Uploaded documents can be turned into normalized text with source locations,
-> split into deterministic chunks, and embedded into vectors with a local CPU
-> model; everything is stored in SQLite.
-> Vector search, retrieval, reranking, RAG answers, and other AI features are
+> split into deterministic chunks, embedded into vectors with a local CPU
+> model, and searched by meaning; everything is stored in SQLite.
+> Reranking, hybrid search, RAG answers, and other AI features are
 > planned but **not implemented yet**.
 
 ## Current Features
@@ -27,6 +27,7 @@ Production-oriented RAG Telegram knowledge assistant
 - `GET /documents/{document_id}/chunks` — list the stored chunks and their source locations
 - `POST /documents/{document_id}/embed` — embed the chunks with a local model (CPU)
 - `GET /documents/{document_id}/embeddings` — embedding status (valid / missing / stale)
+- `POST /search` — exact vector search over all valid chunk vectors (optional `document_id` filter)
 - Supported file types: PDF, DOCX, TXT (max 10 MB)
 - Local development storage in `storage/` (uploads, processed output, SQLite metadata)
 
@@ -36,6 +37,12 @@ Production-oriented RAG Telegram knowledge assistant
 - E5 input contract: chunks are embedded as `passage: <text>`, questions as `query: <text>`
 - 384-dimensional, normalized float32 vectors stored in SQLite, up to 512 tokens per chunk
 - Stale-vector detection (full embedding contract + text hash); re-running is idempotent
+
+**Vector search** ([app/search/](app/search/))
+
+- Exact brute-force cosine similarity (NumPy dot product of unit vectors), only over vectors valid for the current contract
+- Deterministic ranking (score, then `chunk_id`), `top_k` 1–50, read-only, never returns vectors
+- A small hand-labelled retrieval baseline (Recall@1/3/5) for later comparison
 
 The Telegram bot and the web API are two **separate programs**. They are not
 connected to each other yet.
@@ -313,6 +320,74 @@ embeddings whose chunk was longer than the model can read (see
 [Limitations](#embedding-limitations)). It returns `400` for an invalid ID and
 `404` for an unknown document.
 
+### `POST /search`
+
+Exact vector search over every chunk whose stored vector is valid for the
+current embedding contract (see [Vector Search](#vector-search)). The
+question is embedded as `query: <question>`; nothing is stored.
+
+Request (JSON body):
+
+```json
+{
+  "query": "What is FastAPI used for?",
+  "top_k": 5,
+  "document_id": "8adc0251f64d4cf983e29ce470705707"
+}
+```
+
+| Field | Rules |
+|---|---|
+| `query` | Required text, 1–4000 characters; surrounding whitespace is removed and it must not be blank |
+| `top_k` | Optional whole number from 1 to 50 (default 5); `"5"`, `5.0` and `true` are rejected |
+| `document_id` | Optional; search only this document. Omit it to search all documents |
+
+Unknown fields are rejected, so a typo like `"topk"` is not silently ignored.
+
+Success — `200 OK` (best result first; the vectors themselves are never returned):
+
+```json
+{
+  "query": "What is FastAPI used for?",
+  "top_k": 5,
+  "document_id": null,
+  "results": [
+    {
+      "rank": 1,
+      "score": 0.906475,
+      "chunk_id": "8adc0251f64d4cf983e29ce470705707_v1_s1200_o200_00000",
+      "document_id": "8adc0251f64d4cf983e29ce470705707",
+      "chunk_index": 0,
+      "source_filename": "notes.txt",
+      "source_locations": [{"block": 1, "line_start": 1, "line_end": 1, "char_start": 0, "char_end": 52}],
+      "truncated": false,
+      "text": "FastAPI is a Python web framework for building APIs."
+    }
+  ]
+}
+```
+
+- `score` is the cosine similarity (−1 to 1, rounded to 6 decimals). It is a
+  **relative** number for ranking, not a probability and not a "confidence".
+- `truncated: true` means the model only read the first 512 tokens of this
+  chunk (see [Embedding limitations](#embedding-limitations)).
+- There is no `document_version` field: the database has no document version.
+  Re-processing a document deletes its old chunks and vectors, so results can
+  never come from an older version of the processed text.
+- If nothing is searchable (empty database, no valid vectors, or a document
+  without valid vectors), the answer is `200` with `"results": []`; the model
+  is not even loaded in that case.
+
+Errors:
+
+| Status | When |
+|---|---|
+| `400 Bad Request` | `document_id` is not a valid document ID (`{"detail": "Invalid document ID."}`) |
+| `404 Not Found` | No document with this `document_id` |
+| `422 Unprocessable Content` | Invalid JSON, missing/blank/too long `query`, `top_k` outside 1–50 or not a whole number, unknown fields (FastAPI's standard validation format) |
+| `503 Service Unavailable` | The model could not be loaded |
+| `500 Internal Server Error` | A stored vector is corrupted, the model returned an invalid query vector, the database could not be read, or an unexpected error happened (only a short safe message, never internal details) |
+
 Interactive API docs are available at `http://127.0.0.1:8000/docs` while the server runs.
 
 ## File Upload Rules
@@ -324,7 +399,7 @@ Interactive API docs are available at `http://127.0.0.1:8000/docs` while the ser
 - Files are stored locally in `storage/uploads/`. Uploaded files are ignored by Git.
 - Uploading only stores the file. Text is extracted when the process endpoint
   is called, chunks when the chunk endpoint is called, and vectors when the
-  embed endpoint is called. Documents are **not indexed or searchable** yet.
+  embed endpoint is called. Only embedded chunks can be found by `POST /search`.
 
 ### Security limitations (development only)
 
@@ -444,8 +519,8 @@ A **chunk** is a small piece of a processed document. Later stages
 (Embedding → Vector Search → RAG) will work on chunks, not whole documents:
 an embedding model can only take a limited amount of text, and a small,
 focused piece of text is easier to find and to cite than a whole book.
-Chunks can be embedded (see [Embeddings](#embeddings)); nothing searches
-them yet.
+Chunks can be embedded (see [Embeddings](#embeddings)) and then searched
+(see [Vector Search](#vector-search)).
 
 ```
 Processed document (storage/processed/<id>.json, status "completed")
@@ -581,9 +656,9 @@ Code: [app/embeddings/](app/embeddings/)
 - **Dimension** — 向量有多少个数字。A **384-dimensional embedding** is a vector
   of 384 numbers, e.g. `[0.021, -0.113, 0.087, …]` (384 values).
 
-Chunks need embeddings because a later search step (not built yet) will
-compare a question's vector with every chunk's vector to find the chunks with
-the closest meaning. This batch only **creates and stores** the vectors.
+Chunks need embeddings because [Vector Search](#vector-search) compares a
+question's vector with every chunk's vector to find the chunks with the
+closest meaning. This section covers **creating and storing** the vectors.
 
 ```
 Chunks (SQLite, chunk_index order)
@@ -648,7 +723,7 @@ is reading. The model card requires:
 | Text | Exact model input | Method |
 |---|---|---|
 | Document chunk | `passage: FastAPI is a Python web framework.` | `embed_documents()` |
-| Question (future search) | `query: What is FastAPI?` | `embed_query()` |
+| Question (`POST /search`) | `query: What is FastAPI?` | `embed_query()` |
 
 - The prefix is added **only at embedding time**, in `provider.py`. The chunk
   text stored in the `chunks` table is never changed and never starts with
@@ -660,7 +735,7 @@ is reading. The model card requires:
   always use `query: `, and that the service refuses a vector whose input hash
   does not match `passage: ` + chunk text.
 - Both kinds of vectors come from the same model and live in the same
-  embedding space, so a query vector can later be compared with chunk vectors.
+  embedding space, so a query vector can be compared with chunk vectors (see [Vector Search](#vector-search)).
 
 ### Model cache and network
 
@@ -786,10 +861,156 @@ and no timestamps influence a vector.
   (~490 MB) took about 80 s on the development network.
 - Embedding is synchronous; a large document keeps the request waiting.
 - Re-chunking deletes embeddings, even if the chunk text did not change.
-- Retrieval quality has **not** been evaluated; the model is a development
-  baseline, not a benchmark winner.
-- There is **no vector search, no vector database, no retrieval, no reranking,
-  and no RAG answer generation** yet. Vectors are stored only.
+- Retrieval quality has only a tiny development baseline (see
+  [Retrieval baseline](#retrieval-baseline)); the model is not a benchmark winner.
+- There is **no vector database, no reranking and no RAG answer generation**
+  yet. The vectors are used by the exact [Vector Search](#vector-search).
+
+## Vector Search
+
+Code: [app/search/](app/search/)
+
+### 概念
+
+- **Vector Search（向量检索）** — 不按关键词找，而是按"意思"找。先把问题变成一个向量，
+  再和每个 chunk 的向量比较，返回意思最接近的 chunk。
+  例：问 "What is FastAPI used for?"，即使 chunk 里没有 "used for" 这几个词，
+  "FastAPI is a Python web framework for building APIs." 也会排在最前面。
+- **Query Embedding（查询向量）** — 用**同一个**模型把用户的问题变成向量。E5 模型要求问题前加
+  `query: `，文档 chunk 前加 `passage: `：
+
+  | 文本 | 模型真正读到的输入 |
+  |---|---|
+  | 问题 `FastAPI 是做什么的？` | `query: FastAPI 是做什么的？` |
+  | Chunk `FastAPI is a Python web framework…` | `passage: FastAPI is a Python web framework…` |
+
+  前缀只在调用模型时临时加上：`chunks.text` 永远是原文，问题本身也**不会**被保存到数据库或日志里。
+- **Similarity Score（相似度分数）** — 两个向量方向有多接近。这里用 **Cosine Similarity
+  （余弦相似度）**：`1` = 方向相同（意思很接近），`0` = 无关，`-1` = 方向相反。
+  分数只用来**排序**，不是概率，也不是"答案正确的把握"。上面的 smoke test 里相关 chunk
+  约 0.87–0.91，无关 chunk 也有约 0.72–0.83（E5 模型的分数普遍偏高），所以不能用一个固定分数线判断"相关"。
+- **为什么 normalized vectors 可以直接用 dot product（点积）** —
+  `cosine(a, b) = dot(a, b) / (|a| × |b|)`。所有存储的向量和查询向量长度都是 1
+  （embedding contract 里 `normalized = true`），分母就是 1，所以 cosine = dot。
+  代码会**检查**每个向量的长度真的约等于 1，不符合就拒绝，而不是偷偷重新 normalize
+  （那会掩盖数据损坏或模型问题）。
+
+### 运行流程
+
+```
+POST /search {"query": "...", "top_k": 5, "document_id": 可选}
+→ 校验 query（去掉首尾空白，1–4000 字符）和 top_k（1–50）
+→ 一条 SQL：读取 embeddings + chunks（可按 document_id 过滤，"?" 占位符）
+→ 只保留当前 contract 下 VALID 的向量（与 embedding status 用同一个规则：EmbeddingRecord.is_valid_for）
+→ 没有可搜索的向量？直接返回 results: []（不加载模型）
+→ "query: " + 问题 → 同一个本地模型（同一个已加载的实例）→ 查询向量
+→ 检查所有向量：维度、NaN/Inf、长度为 1
+→ scores = candidate_matrix @ query_vector（NumPy，一次算完 N 个点积）
+→ 排序：score 从高到低；分数相同按 chunk_id 从小到大 → 取前 top_k
+→ 返回 chunk 原文、位置和分数（从不返回向量）
+```
+
+| File | Responsibility |
+|---|---|
+| `models.py` | 限制（`top_k` 默认 5、最大 50；query 最长 4000 字符）、结果类型、错误、校验函数 |
+| `similarity.py` | NumPy 余弦相似度，检查维度、有限值（finite）和长度为 1 |
+| `storage.py` | 只读的 SQLite 查询；复用现有的行解析、`is_valid_for()` 和 `deserialize_vector()` |
+| `service.py` | 流程编排与排序（`rank_top_k`） |
+| `app/api.py` | `POST /search`：HTTP 校验和 JSON 格式 |
+
+API 层只负责 HTTP，service 负责流程，storage 负责读数据，similarity 负责数学。以后换成
+向量索引时，只需要替换 storage + similarity，API 不用重写。
+
+### 哪些向量可以参加搜索
+
+只有对**当前** embedding contract 完全有效的向量：`model_name`、`model_revision`、
+`embedding_version`、`dimension`、`max_tokens`、`dtype`、`normalized`、`passage_prefix`
+都必须一致，`text_sha256` 必须等于当前 chunk 原文的哈希，`input_sha256` 必须等于
+`passage: ` + 原文的哈希。判断规则只有**一个**（`EmbeddingRecord.is_valid_for`），
+搜索和 `GET /documents/{id}/embeddings` 用的是同一个函数，所以两者永远不会对"哪些向量有效"
+给出不同答案。
+
+- **Stale（过期）向量**：直接跳过，连字节都不读；搜索**不会**删除、更新或重新生成它们
+  （重新生成请调用 `POST /documents/{id}/embed`）。
+- **Truncated（被截断）的向量**：照常参与搜索（它仍然有用），结果里 `truncated: true` 作为质量提示。
+- **损坏的向量**（contract 有效，但字节长度错误、字节序错误、NaN、Inf、长度不是 1）：
+  整个搜索安全失败（`500`，`"Stored embedding data is corrupted."`），服务器日志记录
+  chunk_id 和错误类型。选择"失败"而不是"跳过"，是因为悄悄少一个 chunk 的结果看起来正常、
+  实际却是错的，而损坏的数据库需要被发现。
+
+### Ranking（排序）是确定的
+
+同样的数据库 + 同样的问题 → 同样的结果顺序。排序规则：先 `score` 从高到低，分数相同时按
+`chunk_id` 从小到大，从不依赖 SQLite 返回行的顺序。分数先四舍五入到 6 位小数再排序：
+float32 向量本身区分不了更小的差别，这样只差"浮点噪声"的两个 chunk 被视为同分，
+按 chunk_id 排，顺序也和响应里看到的分数一致。
+
+### 为什么现在用 exact brute-force，而不用 Qdrant / FAISS
+
+**Exact brute-force search（精确暴力检索）**：把问题和**每一个**有效 chunk 都比较一次。
+
+- 复杂度约 **O(N × D)**：N = chunk 数量，D = 384（向量维度）。
+- 结果是**精确**的：不会像近似索引（ANN，例如 HNSW）那样偶尔漏掉最相似的 chunk。
+  这正是现在需要的 **correctness baseline（正确性基线）**：以后引入索引时，可以拿它的结果对比。
+- 不需要额外的服务、依赖或数据同步；向量已经在 SQLite 里（little-endian float32 BLOB）。
+- 只用到 NumPy（fastembed 本来就依赖它；`requirements.txt` 里现在明确写出了已安装的版本
+  `numpy==2.5.3`）。没有 FAISS、Qdrant、Chroma、pgvector 等。
+
+**适用范围：本地开发和小规模文档集合。它不是为几百万个 chunk 设计的。**
+每次搜索都会从 SQLite 读取全部候选向量。在开发笔记本（Intel i5-1334U，16 GB）上用合成的
+384 维数据测量（不含模型；这台笔记本的计时波动很大）：
+
+| 有效 chunk 数 | 一次搜索 | Python 内存峰值 |
+|---|---|---|
+| 1,000 | 约 50–240 ms | 约 20 MiB |
+| 5,000 | 约 0.4–1.1 s | 约 98 MiB |
+| 10,000 | 约 0.9–2.4 s | 约 197 MiB |
+
+真正的相似度计算（`matrix @ query`）即使 10,000 个向量也只要约 2–4 ms；大部分时间花在
+逐个读取和校验向量（Python 级别的 NaN/Inf 检查）以及把它们组成矩阵上。用真实模型、4 个 chunk
+时，一次完整搜索约 25–70 ms（模型已加载；主要是把问题变成向量的时间）。第一次搜索还要先加载模型
+（约 2–4 s）。等检索质量评估建立起来之后，再考虑向量索引或向量数据库。
+
+### Retrieval baseline
+
+一个很小的、人工标注的**开发基线**（[tests/retrieval_baseline.py](tests/retrieval_baseline.py)）：
+16 个一段话的 chunk（英文和中文，其中有故意相近的干扰项，例如 FastAPI 与 Flask、SQLite 与
+PostgreSQL），8 个问题（英文、中文，以及 1 个"中文问题 → 英文答案"的跨语言问题）。
+
+**Recall@K** = 正确的 chunk 出现在前 K 个结果里的问题比例。当前测量结果
+（`multilingual-e5-small` + exact search）：
+
+| Recall@1 | Recall@3 | Recall@5 |
+|---|---|---|
+| 0.875 (7/8) | 0.875 (7/8) | 1.000 (8/8) |
+
+唯一没排第一的是跨语言问题 `为什么要把长文档切成小块？`：英文的 chunking 段落排在第 4 位，
+前 3 位都是无关的**中文**段落。也就是说，在这个小例子里，模型更偏向"同一种语言"而不是
+"同一个主题"。这是后续评估需要重点看的地方。
+
+注意：
+
+- 这是**开发基线**：只有 8 个问题，每个问题就占 12.5%，数字很粗糙。
+- **不是**和其他模型的 benchmark，也**不是**生产质量的证明。
+- 它的用途是给以后的 batch（chunking 策略、reranking、换模型）提供一个固定的对比起点。
+- 测试里设置了远低于当前值的下限（Recall@1 ≥ 0.6、@3 ≥ 0.8、@5 ≥ 0.9），只用来发现
+  "流水线坏了"（例如前缀用反），不是质量目标。
+
+### Current limitations
+
+- **Brute force O(N × D)**，每次搜索读取全部候选；适合小规模，不适合大规模。
+- **同步执行**：搜索在请求里完成，没有后台任务或缓存。
+- **长的纯中文 chunk 仍可能被截断。** Vector Search 可以正常使用当前的 embeddings，但 1200 字符的
+  纯中文 chunk 可能超过 512 tokens，模型只读到前面约 750–800 个字符，后面的内容不影响向量，
+  所以这类 chunk 的检索质量可能受影响（结果里 `truncated: true`）。本 batch 没有修改 chunk_size /
+  chunk_overlap / chunk ID；以后通过检索评估和 chunking 策略再研究。
+- 问题同样最多读 512 tokens（包括 `query: `），更长的部分被模型忽略。
+- 跨语言检索在 baseline 里明显弱于同语言检索（见上）。
+- **No reranking, no hybrid search**（没有 BM25 / 关键词检索），没有 metadata filter（只有 `document_id`）。
+- **No vector database / vector index**。
+- **No RAG answer generation**：搜索只返回相关的 chunk，不生成答案，也不生成引用。
+- 请求体大小没有全局上限（整个 API 都是如此）；`query` 超过 4000 字符会被拒绝，但请求体会先被读进内存。
+  部署时应由反向代理或服务器限制请求大小。
 
 ## Local Setup
 
@@ -851,3 +1072,14 @@ runs offline):
 $env:DOCUBOT_RUN_MODEL_SMOKE_TEST = "1"
 .venv\Scripts\python.exe -m unittest tests.test_embedding_smoke -v
 ```
+
+With the same variable set, the real-model search smoke test and the
+retrieval baseline (Recall@1/3/5 printed to the console) run like this:
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -p "test_search_smoke.py" -v
+```
+
+Search ranking itself is tested with hand-made unit vectors (not a model),
+so a broken similarity or sorting step always fails a test
+([tests/test_search.py](tests/test_search.py)).

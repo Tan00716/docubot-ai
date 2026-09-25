@@ -9,9 +9,10 @@ Endpoints:
     GET  /documents/{document_id}/chunks  -> list the stored chunks
     POST /documents/{document_id}/embed   -> embed the chunks with the local model
     GET  /documents/{document_id}/embeddings -> embedding status (no vectors)
+    POST /search                          -> exact vector search over valid chunk vectors
 
-Processing, chunking and embedding are synchronous. There is NO vector
-search, no retrieval and no RAG yet: vectors are only stored in SQLite.
+Processing, chunking, embedding and search are synchronous. Search returns
+ranked chunks only: there is NO reranking and no RAG answer generation yet.
 
 Run locally from the project root:
 
@@ -26,7 +27,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.document_processing import database
 from app.document_processing.chunking import (
@@ -70,6 +71,18 @@ from app.embeddings.models import (
 )
 from app.embeddings.provider import EmbeddingProvider, FastEmbedProvider
 from app.embeddings.service import embed_document, get_embedding_status
+from app.search.models import (
+    DEFAULT_TOP_K,
+    MAX_QUERY_LENGTH,
+    MAX_TOP_K,
+    InvalidQueryVectorError,
+    InvalidSearchQueryError,
+    InvalidTopKError,
+    SearchNotSupportedError,
+    SearchResult,
+    validate_query,
+)
+from app.search.service import search
 
 # --- Configuration ----------------------------------------------------------
 
@@ -238,6 +251,79 @@ class EmbeddingStatusResponse(EmbeddingContractResponse):
     truncated_chunks: int  # the model only read the first part of these chunks
 
 
+class SearchRequest(BaseModel):
+    """A search question. Unknown fields and wrong types (e.g. "5" for top_k) are rejected."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"query": "What is FastAPI?", "top_k": 5}]},
+    )
+
+    query: str = Field(
+        strict=True,
+        min_length=1,
+        max_length=MAX_QUERY_LENGTH,
+        description="The question. Surrounding whitespace is removed; it must not be blank.",
+    )
+    top_k: int = Field(
+        default=DEFAULT_TOP_K,
+        strict=True,
+        ge=1,
+        le=MAX_TOP_K,
+        description="How many chunks to return at most.",
+    )
+    document_id: str | None = Field(
+        default=None,
+        strict=True,
+        description="Search only this document (32 lower-case hex characters). "
+        "Omit it to search every document.",
+    )
+
+    @field_validator("query")
+    @classmethod
+    def query_must_not_be_blank(cls, value: str) -> str:
+        try:
+            return validate_query(value)
+        except InvalidSearchQueryError as error:
+            raise ValueError(error.safe_message)
+
+
+class SearchResultResponse(BaseModel):
+    """One ranked chunk. The vector itself is never returned."""
+
+    rank: int  # 1 = most similar
+    score: float  # cosine similarity from -1 to 1 (not a probability)
+    chunk_id: str
+    document_id: str
+    chunk_index: int
+    source_filename: str
+    source_locations: list[dict[str, int]]
+    truncated: bool  # the model only read the first part of this chunk
+    text: str
+
+    @classmethod
+    def from_result(cls, result: SearchResult) -> "SearchResultResponse":
+        chunk = result.chunk
+        return cls(
+            rank=result.rank,
+            score=result.score,
+            chunk_id=chunk.chunk_id,
+            document_id=chunk.document_id,
+            chunk_index=chunk.chunk_index,
+            source_filename=chunk.source_filename,
+            source_locations=[dict(location) for location in chunk.source_locations],
+            truncated=result.truncated,
+            text=chunk.text,
+        )
+
+
+class SearchResponse(BaseModel):
+    query: str  # the trimmed question that was searched
+    top_k: int
+    document_id: str | None
+    results: list[SearchResultResponse]  # best first; empty if nothing is searchable
+
+
 app = FastAPI(title="DocuBot AI API")
 
 
@@ -275,6 +361,10 @@ PROCESSING_ERROR_STATUS = {
     UnsupportedEmbeddingModelError: status.HTTP_500_INTERNAL_SERVER_ERROR,
     EmbeddingError: status.HTTP_500_INTERNAL_SERVER_ERROR,
     EmbeddingDimensionError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    InvalidSearchQueryError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    InvalidTopKError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    SearchNotSupportedError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    InvalidQueryVectorError: status.HTTP_500_INTERNAL_SERVER_ERROR,
 }
 
 
@@ -526,4 +616,35 @@ def embedding_status(
         stale_embeddings=result.stale_embeddings,
         truncated_chunks=result.truncated_chunks,
         **EmbeddingContractResponse.contract_fields(result.contract),
+    )
+
+
+# --- Search -------------------------------------------------------------------
+
+
+@app.post("/search")
+def vector_search(
+    request: SearchRequest,
+    provider: Annotated[EmbeddingProvider, Depends(get_embedding_provider)],
+) -> SearchResponse:
+    """Find the chunks whose meaning is closest to the question (exact vector search).
+
+    The question is embedded as "query: <question>" with the same local model
+    that embedded the chunks, then compared with every chunk vector that is
+    valid for the current embedding contract (stale vectors are ignored).
+    Results are ranked by score (highest first), ties by chunk_id. Nothing
+    is stored: not the question, not the query vector. Vectors are never returned.
+    """
+    result = search(
+        request.query,
+        db_path=DATABASE_PATH,
+        provider=provider,
+        top_k=request.top_k,
+        document_id=request.document_id,
+    )
+    return SearchResponse(
+        query=result.query,
+        top_k=result.top_k,
+        document_id=result.document_id,
+        results=[SearchResultResponse.from_result(item) for item in result.results],
     )

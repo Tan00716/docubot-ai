@@ -126,6 +126,15 @@ CHUNK_INSERT_COLUMNS = (
     "chunking_version, chunk_size, chunk_overlap, created_at"
 )
 
+# The columns that to_chunk() expects, in this order. Every query that
+# reads chunks (here and in app/search/storage.py) selects exactly these.
+CHUNK_SELECT_COLUMNS = (
+    "c.chunk_id, c.document_id, c.chunk_index, c.text, c.char_count, "
+    "c.source_locations, c.chunking_version, c.chunk_size, c.chunk_overlap, "
+    "c.created_at, d.original_filename, d.extension"
+)
+CHUNK_SELECT_COLUMN_COUNT = len(CHUNK_SELECT_COLUMNS.split(","))  # 12
+
 CORRUPTED_CHUNKS_MESSAGE = "Stored chunk data is corrupted."
 
 
@@ -360,16 +369,14 @@ def get_chunk_set(db_path: Path, document_id: str) -> ChunkSet:
     """Return all chunks of a document in chunk_index order (maybe none)."""
     with connect(db_path) as connection:
         rows = connection.execute(
-            "SELECT c.chunk_id, c.document_id, c.chunk_index, c.text, c.char_count, "
-            "c.source_locations, c.chunking_version, c.chunk_size, c.chunk_overlap, "
-            "c.created_at, d.original_filename, d.extension "
+            f"SELECT {CHUNK_SELECT_COLUMNS} "
             "FROM chunks AS c JOIN documents AS d ON d.document_id = c.document_id "
             "WHERE c.document_id = ? ORDER BY c.chunk_index",
             (document_id,),
         ).fetchall()
 
     try:
-        chunks = tuple(_to_chunk(row) for row in rows)
+        chunks = tuple(to_chunk(row) for row in rows)
     except (ValueError, TypeError) as error:
         logger.error("Corrupted chunk data for document %s: %s", document_id, type(error).__name__)
         raise StorageError(CORRUPTED_CHUNKS_MESSAGE)
@@ -383,8 +390,11 @@ def get_chunk_set(db_path: Path, document_id: str) -> ChunkSet:
     return ChunkSet(document_id=document_id, chunks=chunks, created_at=created_at)
 
 
-def _to_chunk(row: tuple) -> Chunk:
-    """Turn one database row into a Chunk, checking the stored JSON."""
+def to_chunk(row: tuple) -> Chunk:
+    """Turn one database row (CHUNK_SELECT_COLUMNS) into a Chunk, checking the stored JSON.
+
+    Raises ValueError or TypeError for corrupted rows.
+    """
     text, char_count = row[3], row[4]
     if not isinstance(text, str) or char_count != len(text):
         raise ValueError("Invalid chunk text.")

@@ -233,7 +233,7 @@ class FastEmbedProvider:
         ]
 
     def embed_query(self, text: str) -> tuple[float, ...]:
-        """Embed a (future) search question ("query: " + text), same model and contract.
+        """Embed a search question ("query: " + text), same model and contract.
 
         model.embed() is used for both kinds of text, so the only prefix is
         the one added here (FastEmbed adds none for custom models).

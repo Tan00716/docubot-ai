@@ -10,5 +10,5 @@ Modules:
     storage.py  - SQLite reads/writes for the "embeddings" table
     service.py  - the pipeline: chunks -> provider -> SQLite
 
-There is NO vector search, retrieval or RAG yet: vectors are only stored.
+Vector search over these vectors lives in app/search/.
 """
