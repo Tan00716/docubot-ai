@@ -2,7 +2,7 @@
 
 Only the embedding model changes between runs. Everything else is fixed:
 
-    passages + questions + labels   the Batch 6A dataset, frozen by DATASET_SHA256
+    passages + questions + labels   a versioned dataset artifact, checksum verified
     chunking                        production ChunkingConfig() = 1200 / 200
     search + ranking + top_k        app.search.service.search, top_k = MAX_TOP_K
     metrics                         app.evaluation.metrics (Recall@1/3/5, MRR)
@@ -69,6 +69,7 @@ class Hit:
     score: float  # full precision
     language: str
     relevant: bool
+    hard_negative: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ class ModelResult:
     queries: tuple[QueryRecord, ...]
     checks: dict[str, bool]  # vector / input contract checks of the real run
     resources: dict[str, float | int | str | None]
+    dataset_version: str = "retrieval_eval_v1"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=1)
@@ -129,12 +131,17 @@ class ModelResult:
 
 def collect_result(key: str, spec: EmbeddingModelSpec, kb: KnowledgeBase,
                    results: Sequence[QueryResult], *, checks: dict[str, bool],
-                   resources: dict[str, float | int | str | None]) -> ModelResult:
+                   resources: dict[str, float | int | str | None],
+                   dataset_version: str = "retrieval_eval_v1",
+                   dataset_sha256: str | None = None,
+                   hard_negatives: dict[str, Sequence[str]] | None = None) -> ModelResult:
     """Turn one runner.evaluate() run into plain data."""
     queries = []
     for result in results:
         relevant = relevant_chunk_ids(kb, result.query)
-        top = tuple(Hit(chunk_id, score, kb.chunks[chunk_id].language, chunk_id in relevant)
+        hard_negative_keys = set((hard_negatives or {}).get(result.query.query_id, ()))
+        top = tuple(Hit(chunk_id, score, kb.chunks[chunk_id].language, chunk_id in relevant,
+                        kb.chunks[chunk_id].passage_key in hard_negative_keys)
                     for chunk_id, score in result.ranking[:TOP_N])
         queries.append(QueryRecord(
             query_id=result.query.query_id, direction=result.outcome.direction,
@@ -144,9 +151,10 @@ def collect_result(key: str, spec: EmbeddingModelSpec, kb: KnowledgeBase,
     chunks = tuple(ChunkRecord(c.chunk_id, c.passage_key, c.language, text_sha256(c.text),
                                c.tokens, c.truncated) for c in kb.chunks.values())
     return ModelResult(
-        key=key, model_name=spec.name, revision=spec.revision, dimension=spec.dimension,
+        key=key, dataset_version=dataset_version, model_name=spec.name,
+        revision=spec.revision, dimension=spec.dimension,
         max_tokens=spec.max_tokens, pooling=spec.pooling, passage_prefix=spec.passage_prefix,
-        query_prefix=spec.query_prefix, dataset_sha256=dataset_fingerprint(),
+        query_prefix=spec.query_prefix, dataset_sha256=dataset_sha256 or dataset_fingerprint(),
         chunks=chunks, queries=tuple(queries), checks=dict(checks), resources=dict(resources),
     )
 
@@ -154,22 +162,33 @@ def collect_result(key: str, spec: EmbeddingModelSpec, kb: KnowledgeBase,
 # --- Integrity ----------------------------------------------------------------
 
 
-def validate_result(result: ModelResult) -> None:
-    """Raise IncompleteResultError unless the result covers exactly the frozen dataset."""
-    if result.dataset_sha256 != DATASET_SHA256:
+def validate_result(result: ModelResult, *, expected_queries: Sequence[GoldenQuery] = QUERIES,
+                    expected_passages: Sequence[Passage] = PASSAGES,
+                    expected_sha256: str = DATASET_SHA256,
+                    expected_chunk_count: int | None = EXPECTED_CHUNKS) -> None:
+    """Raise unless this result covers exactly the selected, checksummed dataset."""
+    if result.dataset_sha256 != expected_sha256:
         raise IncompleteResultError(f"{result.key}: evaluated on another dataset.")
-    if [q.query_id for q in result.queries] != [q.query_id for q in QUERIES]:
+    if [q.query_id for q in result.queries] != [q.query_id for q in expected_queries]:
         raise IncompleteResultError(f"{result.key}: queries missing, added or reordered.")
-    counts = {name: 0 for name in EXPECTED_DIRECTION_COUNTS}
+    direction_counts: dict[str, int] = {}
+    for query in expected_queries:
+        direction = direction_of(query, expected_passages)
+        direction_counts[direction] = direction_counts.get(direction, 0) + 1
+    counts = {name: 0 for name in direction_counts}
+    expected_direction_by_id = {query.query_id: direction_of(query, expected_passages)
+                                for query in expected_queries}
     for query in result.queries:
         if query.direction not in counts:
             raise IncompleteResultError(f"{result.key}: unknown direction {query.direction!r}.")
+        if query.direction != expected_direction_by_id[query.query_id]:
+            raise IncompleteResultError(f"{result.key}: direction changed for {query.query_id}.")
         counts[query.direction] += 1
-    if counts != EXPECTED_DIRECTION_COUNTS:
+    if counts != direction_counts:
         raise IncompleteResultError(f"{result.key}: language directions changed: {counts}.")
-    if len(result.chunks) != EXPECTED_CHUNKS:
+    if expected_chunk_count is not None and len(result.chunks) != expected_chunk_count:
         raise IncompleteResultError(f"{result.key}: {len(result.chunks)} chunks, "
-                                    f"expected {EXPECTED_CHUNKS}.")
+                                    f"expected {expected_chunk_count}.")
 
 
 def check_same_chunks(results: Sequence[ModelResult]) -> None:
@@ -202,11 +221,19 @@ def by_direction(result: ModelResult) -> dict[str, MetricSummary | None]:
 
 
 def cross_language(result: ModelResult) -> MetricSummary:
-    """zh->en and en->zh together; each question counts once."""
-    selected = outcomes(result, CROSS_LANGUAGE_DIRECTIONS)
-    present = {o.direction for o in selected}
-    if present != set(CROSS_LANGUAGE_DIRECTIONS):
+    """All questions whose query and target languages differ, counted once."""
+    selected_directions = (CROSS_LANGUAGE_DIRECTIONS if result.dataset_version == "retrieval_eval_v1"
+                           else None)
+    selected = ([o for o in outcomes(result, selected_directions)] if selected_directions else
+                [o for o in outcomes(result)
+                 if o.direction.split("->")[0] != o.direction.split("->")[1]])
+    expected_directions = (set(CROSS_LANGUAGE_DIRECTIONS) if result.dataset_version == "retrieval_eval_v1"
+                           else {direction for direction in DIRECTIONS
+                                 if direction.split("->")[0] != direction.split("->")[1]})
+    if {item.direction for item in selected} != expected_directions:
         raise IncompleteResultError(f"{result.key}: a cross-language direction is missing.")
+    if not selected:
+        raise IncompleteResultError(f"{result.key}: no cross-language questions are present.")
     return summarize(selected)
 
 
@@ -257,7 +284,10 @@ class CrossLanguageProfile:
 
 
 def cross_language_profile(result: ModelResult) -> CrossLanguageProfile:
-    selected = [q for q in result.queries if q.direction in CROSS_LANGUAGE_DIRECTIONS]
+    selected = ([q for q in result.queries if q.direction in CROSS_LANGUAGE_DIRECTIONS]
+                if result.dataset_version == "retrieval_eval_v1" else
+                [q for q in result.queries
+                 if q.direction.split("->")[0] != q.direction.split("->")[1]])
     ranks = tuple(q.first_relevant_rank for q in selected)
 
     def within(k: int) -> int:

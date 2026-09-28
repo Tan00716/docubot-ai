@@ -54,14 +54,15 @@ from app.evaluation.candidates import (  # noqa: E402
 )
 from app.evaluation.comparison import (  # noqa: E402
     DATASET_SHA256,
+    EXPECTED_CHUNKS,
     IncompleteResultError,
     ModelResult,
     check_same_chunks,
     collect_result,
-    dataset_fingerprint,
     validate_result,
 )
 from app.evaluation.golden import QUERIES  # noqa: E402
+from app.evaluation.dataset_versions import VERSIONS, verify_dataset  # noqa: E402
 from app.evaluation.resources import (  # noqa: E402
     SystemMemory,
     files_size,
@@ -77,6 +78,37 @@ CHILD_TIMEOUT_SECONDS = 45 * 60
 SAMPLE_CHUNKS = 3  # chunks embedded twice to check determinism
 NORM_TOLERANCE = 1e-5  # float32 rounding of a length-1 vector
 EXIT_BASELINE_MISSING, EXIT_DATASET_CHANGED, EXIT_CHILD_FAILED = 1, 3, 4
+KNOWN_PEAK_GIB = {"e5-small": 1.67, "e5-base": 2.28, "bge-m3": 3.4}
+
+
+def comparison_dataset_sha(dataset_version: str, artifact_sha: str) -> str:
+    # Keep the exact Batch 6B fingerprint contract for retrieval_eval_v1.
+    return DATASET_SHA256 if dataset_version == "retrieval_eval_v1" else artifact_sha
+
+
+def selected_model_keys(models: Sequence[str], *, skip_bge: bool = False,
+                        only_bge: bool = False) -> list[str]:
+    keys = ["bge-m3"] if only_bge else list(models)
+    return [key for key in keys if not (skip_bge and key == "bge-m3")]
+
+
+def resource_preflight(candidate: CandidateModel, memory: SystemMemory) -> str | None:
+    """Require known peak plus 25% reserve in free physical and commit memory."""
+    peak = KNOWN_PEAK_GIB.get(candidate.key)
+    if peak is None:
+        return None
+    required_gib = peak * 1.25
+    if (memory.available_physical is None or memory.available_commit is None
+            or memory.available_physical < required_gib * 1024**3
+            or memory.available_commit < required_gib * 1024**3):
+        available_ram = ("unavailable" if memory.available_physical is None else
+                         f"{memory.available_physical / 1024**3:.2f} GiB")
+        available_commit = ("unavailable" if memory.available_commit is None else
+                            f"{memory.available_commit / 1024**3:.2f} GiB")
+        return (f"NOT MEASURED — insufficient safe memory (requires about {required_gib:.2f} GiB; "
+                f"available {available_ram} RAM and {available_commit} commit, against the "
+                f"prior {peak:.2f} GiB peak plus 25% reserve).")
+    return None
 
 
 class CandidateNotCachedError(RuntimeError):
@@ -108,26 +140,26 @@ def record_model_inputs(model: object) -> list[str]:
 
 
 def input_checks(provider: FastEmbedProvider, kb: KnowledgeBase,
-                 seen: Sequence[str]) -> dict[str, bool]:
+                 seen: Sequence[str], queries=QUERIES) -> dict[str, bool]:
     """Did the model receive exactly the documented inputs?
 
     Every chunk as passage_prefix + text, every question as query_prefix +
     text, and nothing else (no swapped, missing or extra prefix).
     """
     passages = {provider.contract.passage_input(chunk.text) for chunk in kb.chunks.values()}
-    queries = {provider.contract.query_input(query.text) for query in QUERIES}
+    query_inputs = {provider.contract.query_input(query.text) for query in queries}
     return {
         "passage_inputs_follow_contract": passages <= set(seen),
-        "query_inputs_follow_contract": queries <= set(seen),
-        "no_other_model_inputs": set(seen) <= passages | queries,
+        "query_inputs_follow_contract": query_inputs <= set(seen),
+        "no_other_model_inputs": set(seen) <= passages | query_inputs,
     }
 
 
-def vector_checks(provider: FastEmbedProvider, kb: KnowledgeBase) -> dict[str, bool]:
+def vector_checks(provider: FastEmbedProvider, kb: KnowledgeBase, queries=QUERIES) -> dict[str, bool]:
     """Dimension, length 1, finite values, determinism and the input hash of real vectors."""
     texts = [chunk.text for chunk in list(kb.chunks.values())[:SAMPLE_CHUNKS]]
     first, second = provider.embed_documents(texts), provider.embed_documents(texts)
-    query_vector = provider.embed_query(QUERIES[0].text)
+    query_vector = provider.embed_query(queries[0].text)
     vectors = [item.vector for item in first] + [query_vector]
     dimension = provider.contract.dimension
     return {
@@ -142,8 +174,10 @@ def vector_checks(provider: FastEmbedProvider, kb: KnowledgeBase) -> dict[str, b
     }
 
 
-def run_one(candidate: CandidateModel, cache_dir: Path) -> ModelResult:
-    """Evaluate one cached model on the frozen dataset. Never downloads."""
+def run_one(candidate: CandidateModel, cache_dir: Path,
+            dataset_version: str = "retrieval_eval_v1") -> ModelResult:
+    """Evaluate one cached model on one checked dataset. Never downloads."""
+    dataset = verify_dataset(dataset_version)
     missing = missing_files(candidate, cache_dir)
     if missing:
         raise CandidateNotCachedError(f"{candidate.key}: {len(missing)} files not cached")
@@ -160,9 +194,9 @@ def run_one(candidate: CandidateModel, cache_dir: Path) -> ModelResult:
     seen = record_model_inputs(model)
 
     with tempfile.TemporaryDirectory(prefix="docubot-compare-") as root:
-        kb = build_knowledge_base(Path(root), provider, ChunkingConfig())
-        results = evaluate(kb, provider)
-        repeat = evaluate(kb, provider)  # queries embedded and searched again
+        kb = build_knowledge_base(Path(root), provider, ChunkingConfig(), dataset.passages)
+        results = evaluate(kb, provider, dataset.queries)
+        repeat = evaluate(kb, provider, dataset.queries)  # queries embedded and searched again
     checks = {
         "official_files_match_spec": True,  # verified above, would have raised
         "revision_pinned": (folder.name == candidate.spec.revision
@@ -172,8 +206,8 @@ def run_one(candidate: CandidateModel, cache_dir: Path) -> ModelResult:
         "deterministic_ranking": fingerprint(results) == fingerprint(repeat),
         "cpu_only": model.model.model.get_providers() == ["CPUExecutionProvider"],
     }
-    checks |= input_checks(provider, kb, seen)
-    checks |= vector_checks(provider, kb)
+    checks |= input_checks(provider, kb, seen, dataset.queries)
+    checks |= vector_checks(provider, kb, dataset.queries)
     end = process_memory()
     searches = [result.search_seconds * 1000 for result in results]
     weights = [candidate.spec.model_file, *candidate.spec.external_data_files]
@@ -192,14 +226,20 @@ def run_one(candidate: CandidateModel, cache_dir: Path) -> ModelResult:
         "embedding_batch_size": provider.config.batch_size,
     }
     return collect_result(candidate.key, candidate.spec, kb, results, checks=checks,
-                          resources=resources)
+                          resources=resources, dataset_version=dataset.version,
+                          dataset_sha256=comparison_dataset_sha(dataset.version, dataset.sha256),
+                          hard_negatives=dataset.hard_negatives)
 
 
-def child_main(key: str, json_path: Path) -> int:
+def child_main(key: str, json_path: Path, dataset_version: str) -> int:
     logging.getLogger("app").setLevel(logging.WARNING)
     try:
-        result = run_one(get_candidate(key), MODEL_CACHE_DIR)
-        validate_result(result)
+        dataset = verify_dataset(dataset_version)
+        result = run_one(get_candidate(key), MODEL_CACHE_DIR, dataset_version)
+        validate_result(result, expected_queries=dataset.queries,
+                        expected_passages=dataset.passages,
+                        expected_sha256=comparison_dataset_sha(dataset.version, dataset.sha256),
+                        expected_chunk_count=None if dataset_version == "retrieval_eval_v2" else EXPECTED_CHUNKS)
     except Exception as error:  # reported by the parent as "failed", with the type only
         print(f"{key}: {type(error).__name__}: {error}", file=sys.stderr)
         return EXIT_CHILD_FAILED
@@ -244,10 +284,11 @@ def resource_skip_reason(candidate: CandidateModel, completed: Sequence[ModelRes
     return None
 
 
-def run_child(key: str, timeout: float) -> tuple[ModelResult | None, str | None]:
+def run_child(key: str, timeout: float, dataset_version: str = "retrieval_eval_v1") -> tuple[ModelResult | None, str | None]:
     with tempfile.TemporaryDirectory(prefix="docubot-compare-result-") as folder:
         json_path = Path(folder) / f"{key}.json"
         command = [sys.executable, "-m", "app.evaluation.compare_models", "--run-one", key,
+                   "--dataset-version", dataset_version,
                    "--json", str(json_path)]
         try:
             finished = subprocess.run(command, cwd=PROJECT_ROOT, timeout=timeout, check=False)
@@ -276,11 +317,14 @@ def environment() -> dict[str, str]:
 def compare(keys: Sequence[str], timeout: float = CHILD_TIMEOUT_SECONDS,
             run: Callable[[str, float], tuple[ModelResult | None, str | None]] = run_child,
             memory: Callable[[], SystemMemory] = system_memory,
-            cache_dir: Path = MODEL_CACHE_DIR) -> tuple[list[ModelResult], dict[str, str]]:
+            cache_dir: Path = MODEL_CACHE_DIR,
+            dataset_version: str = "retrieval_eval_v1",
+            allow_only_candidate: bool = False) -> tuple[list[ModelResult], dict[str, str]]:
     """Run every requested model (baseline first); return the results and the skip reasons."""
     candidates = [get_candidate(key) for key in keys]  # the allowlist
-    if not candidates or candidates[0].key != BASELINE_KEY:
+    if not candidates or (not allow_only_candidate and candidates[0].key != BASELINE_KEY):
         raise ValueError(f"The first model must be the baseline {BASELINE_KEY!r}.")
+    dataset = verify_dataset(dataset_version)
     results: list[ModelResult] = []
     skipped: dict[str, str] = {}
     for candidate in candidates:
@@ -290,16 +334,27 @@ def compare(keys: Sequence[str], timeout: float = CHILD_TIMEOUT_SECONDS,
                                       f"explicitly: python -m app.evaluation.download_candidates "
                                       f"{candidate.key}")
             continue
-        if candidate.optional:
+        if run is run_child:
+            reason = resource_preflight(candidate, memory())
+            if reason:
+                skipped[candidate.key] = reason
+                continue
+        if candidate.optional and run is run_child and len(results) >= 2:
             reason = resource_skip_reason(candidate, results, memory())
             if reason:
                 skipped[candidate.key] = reason
                 continue
-        result, error = run(candidate.key, timeout)
+        if run is run_child:
+            result, error = run_child(candidate.key, timeout, dataset_version)
+        else:
+            result, error = run(candidate.key, timeout)
         if result is None:
             skipped[candidate.key] = error or "failed"
             continue
-        validate_result(result)
+        validate_result(result, expected_queries=dataset.queries,
+                        expected_passages=dataset.passages,
+                        expected_sha256=comparison_dataset_sha(dataset.version, dataset.sha256),
+                        expected_chunk_count=None if dataset_version == "retrieval_eval_v2" else EXPECTED_CHUNKS)
         results.append(result)
     check_same_chunks(results)
     return results, skipped
@@ -309,29 +364,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--models", default=",".join(CANDIDATES),
                         help="comma-separated candidate keys, baseline first")
+    parser.add_argument("--dataset-version", choices=VERSIONS, default="retrieval_eval_v1")
+    parser.add_argument("--skip-bge", action="store_true", help="do not attempt BGE-M3")
+    parser.add_argument("--only-bge", action="store_true", help="evaluate only BGE-M3 if safe and cached")
+    parser.add_argument("--report", type=Path,
+                        help="also save the Markdown report to this path")
     parser.add_argument("--run-one", help=argparse.SUPPRESS)
     parser.add_argument("--json", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.run_one:
-        return child_main(args.run_one, args.json)
+        return child_main(args.run_one, args.json, args.dataset_version)
 
-    if dataset_fingerprint() != DATASET_SHA256:
-        print("The evaluation dataset differs from Batch 6A; refusing to compare.", file=sys.stderr)
+    try:
+        dataset = verify_dataset(args.dataset_version)
+    except (OSError, ValueError, KeyError) as error:
+        print(f"Dataset verification failed: {error}", file=sys.stderr)
         return EXIT_DATASET_CHANGED
     started = time.perf_counter()
-    keys = [key.strip() for key in args.models.split(",") if key.strip()]
+    keys = selected_model_keys([key.strip() for key in args.models.split(",") if key.strip()],
+                               skip_bge=args.skip_bge, only_bge=args.only_bge)
     try:
-        results, skipped = compare(keys)
+        results, skipped = compare(keys, dataset_version=args.dataset_version,
+                                   allow_only_candidate=args.only_bge)
     except (ValueError, IncompleteResultError) as error:
         print(error, file=sys.stderr)
         return EXIT_CHILD_FAILED
-    if not results or results[0].key != BASELINE_KEY:
+    if (not results and skipped and all(
+            reason.startswith("NOT MEASURED") or
+            (args.only_bge and reason.startswith("not cached"))
+            for reason in skipped.values())):
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        report = (f"Dataset: {dataset.version} ({dataset.sha256})\n\n"
+                  "No candidate model was measured; see the skip reasons below.\n\n"
+                  + "\n".join(f"- {key}: {reason}" for key, reason in skipped.items()))
+        if args.report:
+            args.report.write_text(report + "\n", encoding="utf-8")
+        print(report)
+        return 0
+    if not results or (not args.only_bge and results[0].key != BASELINE_KEY):
         print(f"The baseline could not be evaluated: {skipped.get(BASELINE_KEY)}", file=sys.stderr)
         return EXIT_BASELINE_MISSING
     # A redirected stdout uses the Windows locale encoding (e.g. GBK); the report is UTF-8.
     sys.stdout.reconfigure(encoding="utf-8")
-    print(comparison_report.render(results, skipped, environment(),
-                                   time.perf_counter() - started))
+    report = (f"Dataset: {dataset.version} ({dataset.sha256})\n\n" +
+              comparison_report.render(results, skipped, environment(), time.perf_counter() - started))
+    if args.report:
+        args.report.write_text(report + "\n", encoding="utf-8")
+    print(report)
     return 0
 
 

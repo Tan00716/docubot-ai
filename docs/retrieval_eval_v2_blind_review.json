@@ -1,0 +1,900 @@
+{
+  "dataset_version": "retrieval_eval_v2",
+  "review_mode": "blind",
+  "rubric": "RELEVANT: directly supports the answer to the query. PARTIALLY_RELEVANT: related context but insufficient to answer. NOT_RELEVANT: does not support the answer. Judge only the query and passage text.",
+  "records": [
+    {
+      "query_id": "review-c20464bfd299",
+      "query": "Which HTTP method can safely replace a known resource when the same request is repeated?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_en_put-c01",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_en_en_put-c02",
+          "language": "en",
+          "text": "In REST, PUT replaces the state at a known resource URI and is idempotent: repeating the same request has the same effect. POST usually creates a subordinate resource and can create another item on every retry."
+        },
+        {
+          "candidate_id": "v2_en_en_put-c03",
+          "language": "en",
+          "text": "An HTTP timeout bounds how long a client waits for a connection or response. A timeout does not prove the server failed to process the request, so blindly retrying a non-idempotent POST can create duplicate effects."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-108d6100faa5",
+      "query": "Why does an async route still freeze when it calls a synchronous CPU or disk function?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_en_async-c01",
+          "language": "en",
+          "text": "An async FastAPI route should await network operations that provide an asynchronous client. Calling a blocking disk or CPU function directly still blocks the event loop; move such work to a worker thread or process when appropriate."
+        },
+        {
+          "candidate_id": "v2_en_en_async-c02",
+          "language": "mixed",
+          "text": "FastAPI 的 request body 先经过 Pydantic validation；database transaction 应该短小，避免在持有 SQLite write lock 时等待外部 HTTP API。"
+        },
+        {
+          "candidate_id": "v2_en_en_async-c03",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-26ad03f0a1a5",
+      "query": "How can several database writes either all persist or all be undone?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_en_sql_tx-c01",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_en_en_sql_tx-c02",
+          "language": "zh",
+          "text": "SQLite 的 WAL 模式让读者可以继续读取上一次已提交的数据，同时写入者把新内容追加到 WAL 文件。它仍然只允许一个写入者，因此 WAL 并不等于多个写入事务可以同时提交。"
+        },
+        {
+          "candidate_id": "v2_en_en_sql_tx-c03",
+          "language": "zh",
+          "text": "数据库查询应使用参数占位符并单独传入用户值。参数化查询会把输入当作数据处理，避免字符串拼接把输入解释成 SQL 命令；它与事务是否原子是不同的问题。"
+        },
+        {
+          "candidate_id": "v2_en_en_sql_tx-c04",
+          "language": "en",
+          "text": "A SQLite transaction groups related writes so they commit together or roll back together. Keep the transaction short; doing slow network work while holding a write transaction can block other writers."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-8d1e8cd61488",
+      "query": "What does the number of coordinates in an embedding describe?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_en_dimension-c01",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_en_en_dimension-c02",
+          "language": "en",
+          "text": "Embedding dimension is the number of numeric coordinates in each vector. All vectors searched together must have the same dimension. A larger dimension is not itself a guarantee of better retrieval."
+        },
+        {
+          "candidate_id": "v2_en_en_dimension-c03",
+          "language": "en",
+          "text": "L2 normalization scales each embedding to unit length. With unit vectors, the dot product equals cosine similarity. Normalization does not make two semantically unrelated vectors similar; it removes vector magnitude from the comparison."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-d5184f027060",
+      "query": "Why can't I estimate model input length just by counting characters?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_en_tokenizer-c01",
+          "language": "en",
+          "text": "A tokenizer maps text into model-specific token IDs, often subword pieces rather than whole words or characters. Token counts depend on the tokenizer vocabulary and special markers, so character length alone cannot establish whether text fits the model limit."
+        },
+        {
+          "candidate_id": "v2_en_en_tokenizer-c02",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_en_en_tokenizer-c03",
+          "language": "zh",
+          "text": "分词器会把文字转换成模型词表中的 token ID。中文、英文、代码和数字串的字符数与 token 数比例不同，是否超出输入上限必须用对应模型的 tokenizer 计算，不能只按字符估算。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-cdb3dae0277e",
+      "query": "What cost comes with repeating text across adjacent retrieval chunks?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_en_overlap-c01",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_en_en_overlap-c02",
+          "language": "zh",
+          "text": "切块重叠会把前一块末尾的一段文本复制到后一块开头，降低证据句刚好被边界切开的风险。重叠太大则会增加重复块、向量计算和数据库空间。"
+        },
+        {
+          "candidate_id": "v2_en_en_overlap-c03",
+          "language": "en",
+          "text": "Chunk overlap repeats a boundary region in adjacent chunks so evidence near a cut is less likely to be separated from its context. More overlap increases duplicated text, chunk count, embedding work, and storage."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-88baf4eeb553",
+      "query": "Where should a database file live so it survives replacing its container?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_en_docker-c01",
+          "language": "en",
+          "text": "A Docker volume stores data outside a container's writable layer. Replacing the container preserves data in the mounted volume, while files written only inside the container disappear with it."
+        },
+        {
+          "candidate_id": "v2_en_en_docker-c02",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_en_en_docker-c03",
+          "language": "mixed",
+          "text": "Docker container 的 writable layer 会在 container 删除后消失。SQLite database 要放在 mounted volume，重建 container 才能保留 data。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-6095f8520505",
+      "query": "What should happen to a credential after it was accidentally exposed?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_en_key-c01",
+          "language": "mixed",
+          "text": "API key 要放在 environment variable，不要 commit 到 Git 或输出到 logs。发现 secret 泄露后应该 revoke 和 rotate，而不是只做 history rewrite。"
+        },
+        {
+          "candidate_id": "v2_en_en_key-c02",
+          "language": "en",
+          "text": "An API key is a bearer secret: anyone who obtains it may act with its permissions. Keep keys in environment configuration, restrict their scope, rotate exposed keys, and avoid putting them in logs or source control."
+        },
+        {
+          "candidate_id": "v2_en_en_key-c03",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-0de817486ebf",
+      "query": "SQLite 开启 WAL 后是否可以有多个写入者同时提交？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_wal-c01",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_wal-c02",
+          "language": "zh",
+          "text": "SQLite 的 WAL 模式让读者可以继续读取上一次已提交的数据，同时写入者把新内容追加到 WAL 文件。它仍然只允许一个写入者，因此 WAL 并不等于多个写入事务可以同时提交。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_wal-c03",
+          "language": "en",
+          "text": "A SQLite transaction groups related writes so they commit together or roll back together. Keep the transaction short; doing slow network work while holding a write transaction can block other writers."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-561a83c21c10",
+      "query": "请求 JSON 可以解析但字段类型不符合模型时，FastAPI 通常返回什么？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_422-c01",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_422-c02",
+          "language": "zh",
+          "text": "FastAPI 收到可解析但不符合 Pydantic 模型的请求体时，通常返回 422，并在响应中说明字段错误。JSON 语法本身损坏则属于请求格式错误，不能与字段校验失败混为一谈。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_422-c03",
+          "language": "zh",
+          "text": "状态码 404 表示服务器找不到请求的资源，例如文档编号不存在；500 表示服务器内部发生了意料之外的错误，与调用方的请求内容无关。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-8ed44d323880",
+      "query": "重复执行相同的 PUT 请求，资源状态会有什么特点？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_put-c01",
+          "language": "zh",
+          "text": "幂等请求是指相同请求重复执行后，资源状态与执行一次相同。HTTP PUT 通常用于替换已知 URI 对应的资源，因此适合安全重试；POST 创建资源时重复请求可能产生多条记录。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_put-c02",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_put-c03",
+          "language": "zh",
+          "text": "遇到 HTTP 429 时，客户端应降低请求速率，并在服务提供 Retry-After 时按其等待。指数退避和随机抖动可减少多个客户端同时重试造成的拥塞。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-936851b0a790",
+      "query": "Telegram webhook 对机器人服务的网络地址有什么要求？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_webhook-c01",
+          "language": "mixed",
+          "text": "Telegram bot 用 long polling 时会重复调用 getUpdates，并用 offset 标记已经处理的 update。webhook 则由 Telegram 主动请求 bot 的 HTTPS endpoint。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_webhook-c02",
+          "language": "zh",
+          "text": "Telegram webhook 要求机器人服务有公网可访问的 HTTPS 地址，Telegram 会把更新推送到该地址。它和机器人主动调用 getUpdates 的 long polling 是两种不同的接收方式。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_webhook-c03",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-a92fc7c54b6d",
+      "query": "查询向量和数据库向量维度不一样会怎样？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_dimension-c01",
+          "language": "zh",
+          "text": "向量维度是每个 embedding 中数值坐标的数量。参与同一次点积的查询向量和文档向量必须维度一致，否则无法计算；维度相同也不代表模型或向量版本相同。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_dimension-c02",
+          "language": "zh",
+          "text": "余弦相似度比较向量夹角，不直接比较长度。把向量归一化到单位长度后，点积才等于余弦相似度；仅仅把维度增加，并不会自动改善语义匹配。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_dimension-c03",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-39d10aa378e1",
+      "query": "为什么不能只根据中文字数判断文本是否超过 embedding 上限？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_token-c01",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_token-c02",
+          "language": "zh",
+          "text": "分词器会把文字转换成模型词表中的 token ID。中文、英文、代码和数字串的字符数与 token 数比例不同，是否超出输入上限必须用对应模型的 tokenizer 计算，不能只按字符估算。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_token-c03",
+          "language": "zh",
+          "text": "嵌入模型并不是按字或按词来读取文本，而是先用分词器把文本切成子词单元，也就是词元。多语言模型的词表需要同时覆盖上百种语言，常见的英文单词往往能整体对应一个词元，而中文里很多字、甚至常见的双字词都要单独占用一个词元。实际测量时，同样一千个字符，英文大约只有两三百个词元，中文却可能有六七百个。这意味着按字符数设定的块大小，对中文和英文的真实负担完全不同：一个一千二百字符的英文块离上限还很远，一个同样长度的中文块却已经超出。分词器还会在开头和结尾各加一个特殊标记，前缀“passage: ”本身也要占用几个词元，这些都计入上限。因此，讨论块的大小时，最好同时报告字符数和词元数，并且按语言分别统计，而不是用英文的经验比例去估算中文。分词器的结果是确定的：同样的文本和同样版本的词表，每次都会得到完全相同的词元序列，所以词元数可以放心地写进测试。反过来，如果升级了模型或者词表版本，词元数就可能变化，旧的统计结果需要重新测量，之前保存的向量也应当视为过期并重新生成，不能与新模型的向量混在一起比较。\n\n在实际项目里，可以用分词器对自己的语料做一次统计：分别取中文、英文和中英混合的文档，计算每一千个字符大约对应多少个词元，再据此判断当前的块大小会让多少比例的块超过上限。如果大部分中文块都被截断，就说明块的大小对中文来说偏大，需要在缩小块、按语言设置不同的块大小，或者换用上限更长的模型之间做选择。每一种选择都有代价：缩小块会增加块的数量和检索成本，按语言区分会让切分逻辑更复杂，换模型则意味着所有向量都要重新生成，还要重新评估检索质量。\n\n还需要注意，词元的数量不仅取决于语言，也取决于文本的类型。代码片段、网址、长串数字和表格往往会被切成很多零碎的词元，同样的字符数可能比普通中文句子占用更多的名额；而常见的英文技术词汇通常只占一两个词元。因此，只用一种文本测出来的比例去推算整个语料库并不可靠，最好直接用分词器统计真实文档。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-6a4c251a75ba",
+      "query": "Docker 删除容器后，挂载卷里的数据是否也会消失？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_docker-c01",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_docker-c02",
+          "language": "zh",
+          "text": "容器的文件系统是临时的：容器一旦被删除，写在里面的数据库文件和上传文件都会跟着消失。需要长期保存的数据应该放在挂载卷或者绑定到宿主机的目录里，这样即使重新创建容器，数据仍然保留在宿主机上。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_docker-c03",
+          "language": "zh",
+          "text": "Docker image 是创建容器时使用的只读模板。删除容器不会删除 image；容器中的临时写入层会随容器删除，而挂载卷中的持久数据仍然保留。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-052b8f3a6eca",
+      "query": "为什么不应该捕获所有 Python 异常后什么也不做？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_exception-c01",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_exception-c02",
+          "language": "zh",
+          "text": "API token 属于秘密凭证，拿到它的人可能调用其授权范围内的接口。凭证应放在环境变量或秘密管理工具中；一旦泄露，应撤销并轮换，而不是只从最新代码中删除。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_exception-c03",
+          "language": "zh",
+          "text": "Python 中应捕获能够处理的具体异常类型，并保留必要的上下文。捕获所有 Exception 后静默忽略会隐藏编程错误，让任务看似成功却丢失失败信息。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-f35a8f4eb56e",
+      "query": "请求体的字段不符合定义时，服务用什么方式指出校验失败？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_faq_begin-c01",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_faq_begin-c02",
+          "language": "zh",
+          "text": "FastAPI 收到可解析但不符合 Pydantic 模型的请求体时，通常返回 422，并在响应中说明字段错误。JSON 语法本身损坏则属于请求格式错误，不能与字段校验失败混为一谈。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_faq_begin-c03",
+          "language": "zh",
+          "text": "系统采用 FastAPI 接收 HTTP 请求，并用 Pydantic 校验请求体。无效字段会得到 422 响应。SQLite 负责保存文档元数据和向量，事务应尽量短，避免长时间占用写锁。检索使用归一化 embedding 的点积，并通过稳定的块编号处理同分结果。Telegram 机器人目前通过 long polling 获取更新；它不会自动拥有公开的 HTTPS webhook 地址。Docker 部署时，数据库文件必须放进挂载卷，否则删除容器会丢失容器写入层里的文件。上传文件名只作为元数据保存，磁盘路径使用服务端生成的随机名称。API token 不能写入日志，也不能提交到 Git。Python 虚拟环境隔离依赖版本，lock 文件用于复现安装。分词器按子词生成 token，中文字数不能直接换算成 token 数。检索质量应使用固定问题和证据标注来评估。实际部署还要记录依赖的精确版本，避免新版本发布后出现难以复现的行为。服务端日志应记录请求 ID、耗时和状态码，但不要保存用户问题原文、访问令牌或上传文件内容。发生 429 时，客户端应遵守 Retry-After，并采用指数退避和随机抖动。HTTP 超时只表示客户端没有及时收到响应，不代表服务端一定没有完成操作。对于可重复的 PUT 请求，重试通常更安全；对可能新建资源的 POST，重试前应考虑幂等键。数据库查询使用参数占位符，避免把用户输入拼进 SQL 命令。向量维度表示每个 embedding 的坐标数量，参与点积的向量必须维度一致；维度相同也不能证明模型 revision 相同。SQLite WAL 可以让读者看到最近一次提交，但仍只有一个写入者。近似向量索引减少需要访问的候选数量，可能漏掉精确检索会找到的最近邻，因此要与 exact search 比较召回。文档块的 overlap 有助于保留边界附近的完整语句，同时增加重复存储。Docker image 是容器的只读模板，持久数据库文件应放在挂载卷。所有 API secret 都应通过环境配置注入，发现泄露就撤销和轮换。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-46a850eb0c10",
+      "query": "客户端遇到限流响应时，如何避免立刻再次造成拥塞？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_faq_middle-c01",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_faq_middle-c02",
+          "language": "zh",
+          "text": "系统采用 FastAPI 接收 HTTP 请求，并用 Pydantic 校验请求体。无效字段会得到 422 响应。SQLite 负责保存文档元数据和向量，事务应尽量短，避免长时间占用写锁。检索使用归一化 embedding 的点积，并通过稳定的块编号处理同分结果。Telegram 机器人目前通过 long polling 获取更新；它不会自动拥有公开的 HTTPS webhook 地址。Docker 部署时，数据库文件必须放进挂载卷，否则删除容器会丢失容器写入层里的文件。上传文件名只作为元数据保存，磁盘路径使用服务端生成的随机名称。API token 不能写入日志，也不能提交到 Git。Python 虚拟环境隔离依赖版本，lock 文件用于复现安装。分词器按子词生成 token，中文字数不能直接换算成 token 数。检索质量应使用固定问题和证据标注来评估。实际部署还要记录依赖的精确版本，避免新版本发布后出现难以复现的行为。服务端日志应记录请求 ID、耗时和状态码，但不要保存用户问题原文、访问令牌或上传文件内容。发生 429 时，客户端应遵守 Retry-After，并采用指数退避和随机抖动。HTTP 超时只表示客户端没有及时收到响应，不代表服务端一定没有完成操作。对于可重复的 PUT 请求，重试通常更安全；对可能新建资源的 POST，重试前应考虑幂等键。数据库查询使用参数占位符，避免把用户输入拼进 SQL 命令。向量维度表示每个 embedding 的坐标数量，参与点积的向量必须维度一致；维度相同也不能证明模型 revision 相同。SQLite WAL 可以让读者看到最近一次提交，但仍只有一个写入者。近似向量索引减少需要访问的候选数量，可能漏掉精确检索会找到的最近邻，因此要与 exact search 比较召回。文档块的 overlap 有助于保留边界附近的完整语句，同时增加重复存储。Docker image 是容器的只读模板，持久数据库文件应放在挂载卷。所有 API secret 都应通过环境配置注入，发现泄露就撤销和轮换。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_faq_middle-c03",
+          "language": "zh",
+          "text": "遇到 HTTP 429 时，客户端应降低请求速率，并在服务提供 Retry-After 时按其等待。指数退避和随机抖动可减少多个客户端同时重试造成的拥塞。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-148e6774ab75",
+      "query": "使用容器部署时，怎样保留 SQLite 数据库文件？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_zh_faq_end-c01",
+          "language": "zh",
+          "text": "系统采用 FastAPI 接收 HTTP 请求，并用 Pydantic 校验请求体。无效字段会得到 422 响应。SQLite 负责保存文档元数据和向量，事务应尽量短，避免长时间占用写锁。检索使用归一化 embedding 的点积，并通过稳定的块编号处理同分结果。Telegram 机器人目前通过 long polling 获取更新；它不会自动拥有公开的 HTTPS webhook 地址。Docker 部署时，数据库文件必须放进挂载卷，否则删除容器会丢失容器写入层里的文件。上传文件名只作为元数据保存，磁盘路径使用服务端生成的随机名称。API token 不能写入日志，也不能提交到 Git。Python 虚拟环境隔离依赖版本，lock 文件用于复现安装。分词器按子词生成 token，中文字数不能直接换算成 token 数。检索质量应使用固定问题和证据标注来评估。实际部署还要记录依赖的精确版本，避免新版本发布后出现难以复现的行为。服务端日志应记录请求 ID、耗时和状态码，但不要保存用户问题原文、访问令牌或上传文件内容。发生 429 时，客户端应遵守 Retry-After，并采用指数退避和随机抖动。HTTP 超时只表示客户端没有及时收到响应，不代表服务端一定没有完成操作。对于可重复的 PUT 请求，重试通常更安全；对可能新建资源的 POST，重试前应考虑幂等键。数据库查询使用参数占位符，避免把用户输入拼进 SQL 命令。向量维度表示每个 embedding 的坐标数量，参与点积的向量必须维度一致；维度相同也不能证明模型 revision 相同。SQLite WAL 可以让读者看到最近一次提交，但仍只有一个写入者。近似向量索引减少需要访问的候选数量，可能漏掉精确检索会找到的最近邻，因此要与 exact search 比较召回。文档块的 overlap 有助于保留边界附近的完整语句，同时增加重复存储。Docker image 是容器的只读模板，持久数据库文件应放在挂载卷。所有 API secret 都应通过环境配置注入，发现泄露就撤销和轮换。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_faq_end-c02",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_zh_zh_faq_end-c03",
+          "language": "zh",
+          "text": "Docker image 是创建容器时使用的只读模板。删除容器不会删除 image；容器中的临时写入层会随容器删除，而挂载卷中的持久数据仍然保留。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-a4119a2f132b",
+      "query": "服务返回 429 并给出等待时间时，客户端应该怎么做？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_en_retry-c01",
+          "language": "en",
+          "text": "An HTTP client should retry a 503 only when the operation is safe to repeat. Use exponential backoff with jitter and respect Retry-After when present. A 429 rate limit is a different response, but it also tells clients to slow down."
+        },
+        {
+          "candidate_id": "v2_zh_en_retry-c02",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_zh_en_retry-c03",
+          "language": "zh",
+          "text": "遇到 HTTP 429 时，客户端应降低请求速率，并在服务提供 Retry-After 时按其等待。指数退避和随机抖动可减少多个客户端同时重试造成的拥塞。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-3c468164c495",
+      "query": "哪种 HTTP 方法通常用于创建子资源，重复发送可能新建多条？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_en_rest-c01",
+          "language": "zh",
+          "text": "幂等请求是指相同请求重复执行后，资源状态与执行一次相同。HTTP PUT 通常用于替换已知 URI 对应的资源，因此适合安全重试；POST 创建资源时重复请求可能产生多条记录。"
+        },
+        {
+          "candidate_id": "v2_zh_en_rest-c02",
+          "language": "en",
+          "text": "In REST, PUT replaces the state at a known resource URI and is idempotent: repeating the same request has the same effect. POST usually creates a subordinate resource and can create another item on every retry."
+        },
+        {
+          "candidate_id": "v2_zh_en_rest-c03",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-12437501b14c",
+      "query": "单位长度向量的点积和哪个相似度指标相等？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_en_norm-c01",
+          "language": "zh",
+          "text": "余弦相似度比较向量夹角，不直接比较长度。把向量归一化到单位长度后，点积才等于余弦相似度；仅仅把维度增加，并不会自动改善语义匹配。"
+        },
+        {
+          "candidate_id": "v2_zh_en_norm-c02",
+          "language": "en",
+          "text": "L2 normalization scales each embedding to unit length. With unit vectors, the dot product equals cosine similarity. Normalization does not make two semantically unrelated vectors similar; it removes vector magnitude from the comparison."
+        },
+        {
+          "candidate_id": "v2_zh_en_norm-c03",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-0c25f9a36264",
+      "query": "删除 Docker 容器后，容器自身写入层中的文件会怎样？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_en_volume-c01",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_zh_en_volume-c02",
+          "language": "zh",
+          "text": "Docker image 是创建容器时使用的只读模板。删除容器不会删除 image；容器中的临时写入层会随容器删除，而挂载卷中的持久数据仍然保留。"
+        },
+        {
+          "candidate_id": "v2_zh_en_volume-c03",
+          "language": "en",
+          "text": "A Docker volume stores data outside a container's writable layer. Replacing the container preserves data in the mounted volume, while files written only inside the container disappear with it."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-165a0d11473f",
+      "query": "Python lock file 相比宽泛的 requirements 范围提供了什么？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_en_python-c01",
+          "language": "en",
+          "text": "A Python lock file records a resolved set of dependency versions, often including hashes. It helps reproduce an environment, while a broad requirements range alone may resolve to different packages later."
+        },
+        {
+          "candidate_id": "v2_zh_en_python-c02",
+          "language": "zh",
+          "text": "Python 中应捕获能够处理的具体异常类型，并保留必要的上下文。捕获所有 Exception 后静默忽略会隐藏编程错误，让任务看似成功却丢失失败信息。"
+        },
+        {
+          "candidate_id": "v2_zh_en_python-c03",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-beed6134c29a",
+      "query": "近似向量索引相较精确搜索可能牺牲什么？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_en_ann-c01",
+          "language": "en",
+          "text": "Exact vector search scores every stored vector and returns the deterministic highest scores. An approximate index can reduce work on a large collection but may omit a true nearest neighbor; recall must be measured against exact search."
+        },
+        {
+          "candidate_id": "v2_zh_en_ann-c02",
+          "language": "mixed",
+          "text": "HNSW 这类 approximate nearest neighbor index 会少访问一些 vectors 来提升 latency，因此有机会漏掉 exact search 的最近结果；要用 Recall 对照 exact ranking。"
+        },
+        {
+          "candidate_id": "v2_zh_en_ann-c03",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-ad7eeba0989f",
+      "query": "HTTP 客户端超时后，为什么不能认定服务器没有处理 POST？",
+      "query_language": "zh",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_zh_en_timeout-c01",
+          "language": "zh",
+          "text": "遇到 HTTP 429 时，客户端应降低请求速率，并在服务提供 Retry-After 时按其等待。指数退避和随机抖动可减少多个客户端同时重试造成的拥塞。"
+        },
+        {
+          "candidate_id": "v2_zh_en_timeout-c02",
+          "language": "en",
+          "text": "An HTTP timeout bounds how long a client waits for a connection or response. A timeout does not prove the server failed to process the request, so blindly retrying a non-idempotent POST can create duplicate effects."
+        },
+        {
+          "candidate_id": "v2_zh_en_timeout-c03",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-97dac480083e",
+      "query": "What makes repeating a PUT operation suitable for retry?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_zh_put-c01",
+          "language": "zh",
+          "text": "遇到 HTTP 429 时，客户端应降低请求速率，并在服务提供 Retry-After 时按其等待。指数退避和随机抖动可减少多个客户端同时重试造成的拥塞。"
+        },
+        {
+          "candidate_id": "v2_en_zh_put-c02",
+          "language": "zh",
+          "text": "幂等请求是指相同请求重复执行后，资源状态与执行一次相同。HTTP PUT 通常用于替换已知 URI 对应的资源，因此适合安全重试；POST 创建资源时重复请求可能产生多条记录。"
+        },
+        {
+          "candidate_id": "v2_en_zh_put-c03",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-a1673cedc1bf",
+      "query": "What must be reachable for Telegram to deliver updates to a webhook?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_zh_webhook-c01",
+          "language": "zh",
+          "text": "Telegram webhook 要求机器人服务有公网可访问的 HTTPS 地址，Telegram 会把更新推送到该地址。它和机器人主动调用 getUpdates 的 long polling 是两种不同的接收方式。"
+        },
+        {
+          "candidate_id": "v2_en_zh_webhook-c02",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_en_zh_webhook-c03",
+          "language": "mixed",
+          "text": "Telegram bot 用 long polling 时会重复调用 getUpdates，并用 offset 标记已经处理的 update。webhook 则由 Telegram 主动请求 bot 的 HTTPS endpoint。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-8468f888dd71",
+      "query": "Which tool should count actual model tokens for Chinese text?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_zh_token-c01",
+          "language": "zh",
+          "text": "嵌入模型并不是按字或按词来读取文本，而是先用分词器把文本切成子词单元，也就是词元。多语言模型的词表需要同时覆盖上百种语言，常见的英文单词往往能整体对应一个词元，而中文里很多字、甚至常见的双字词都要单独占用一个词元。实际测量时，同样一千个字符，英文大约只有两三百个词元，中文却可能有六七百个。这意味着按字符数设定的块大小，对中文和英文的真实负担完全不同：一个一千二百字符的英文块离上限还很远，一个同样长度的中文块却已经超出。分词器还会在开头和结尾各加一个特殊标记，前缀“passage: ”本身也要占用几个词元，这些都计入上限。因此，讨论块的大小时，最好同时报告字符数和词元数，并且按语言分别统计，而不是用英文的经验比例去估算中文。分词器的结果是确定的：同样的文本和同样版本的词表，每次都会得到完全相同的词元序列，所以词元数可以放心地写进测试。反过来，如果升级了模型或者词表版本，词元数就可能变化，旧的统计结果需要重新测量，之前保存的向量也应当视为过期并重新生成，不能与新模型的向量混在一起比较。\n\n在实际项目里，可以用分词器对自己的语料做一次统计：分别取中文、英文和中英混合的文档，计算每一千个字符大约对应多少个词元，再据此判断当前的块大小会让多少比例的块超过上限。如果大部分中文块都被截断，就说明块的大小对中文来说偏大，需要在缩小块、按语言设置不同的块大小，或者换用上限更长的模型之间做选择。每一种选择都有代价：缩小块会增加块的数量和检索成本，按语言区分会让切分逻辑更复杂，换模型则意味着所有向量都要重新生成，还要重新评估检索质量。\n\n还需要注意，词元的数量不仅取决于语言，也取决于文本的类型。代码片段、网址、长串数字和表格往往会被切成很多零碎的词元，同样的字符数可能比普通中文句子占用更多的名额；而常见的英文技术词汇通常只占一两个词元。因此，只用一种文本测出来的比例去推算整个语料库并不可靠，最好直接用分词器统计真实文档。"
+        },
+        {
+          "candidate_id": "v2_en_zh_token-c02",
+          "language": "zh",
+          "text": "分词器会把文字转换成模型词表中的 token ID。中文、英文、代码和数字串的字符数与 token 数比例不同，是否超出输入上限必须用对应模型的 tokenizer 计算，不能只按字符估算。"
+        },
+        {
+          "candidate_id": "v2_en_zh_token-c03",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-58434bb7b49b",
+      "query": "If removing a leaked API credential from the source is not enough, what should I do?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_zh_secret-c01",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_en_zh_secret-c02",
+          "language": "zh",
+          "text": "Telegram 机器人的令牌相当于它的密码，任何拿到令牌的人都能以这个机器人的身份收发消息。令牌应该放在 .env 文件或环境变量里，并确保 .env 被 Git 忽略。如果令牌已经被推送到公开仓库，仅仅删除那次提交是不够的，因为历史记录和别人的副本里仍然存在；必须立刻通过 BotFather 撤销旧令牌并生成新令牌。"
+        },
+        {
+          "candidate_id": "v2_en_zh_secret-c03",
+          "language": "zh",
+          "text": "API token 属于秘密凭证，拿到它的人可能调用其授权范围内的接口。凭证应放在环境变量或秘密管理工具中；一旦泄露，应撤销并轮换，而不是只从最新代码中删除。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-c7766c4c6956",
+      "query": "How can SQL user input be prevented from becoming executable command text?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_zh_sql-c01",
+          "language": "en",
+          "text": "A SQLite transaction groups related writes so they commit together or roll back together. Keep the transaction short; doing slow network work while holding a write transaction can block other writers."
+        },
+        {
+          "candidate_id": "v2_en_zh_sql-c02",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_en_zh_sql-c03",
+          "language": "zh",
+          "text": "数据库查询应使用参数占位符并单独传入用户值。参数化查询会把输入当作数据处理，避免字符串拼接把输入解释成 SQL 命令；它与事务是否原子是不同的问题。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-f67e71208024",
+      "query": "Why copy part of a passage into its neighboring chunk?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_zh_overlap-c01",
+          "language": "zh",
+          "text": "切块重叠会把前一块末尾的一段文本复制到后一块开头，降低证据句刚好被边界切开的风险。重叠太大则会增加重复块、向量计算和数据库空间。"
+        },
+        {
+          "candidate_id": "v2_en_zh_overlap-c02",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_en_zh_overlap-c03",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-a04beb8ba901",
+      "query": "How should a client respond to a rate limited API that specifies a wait duration?",
+      "query_language": "en",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_en_zh_retry-c01",
+          "language": "en",
+          "text": "When a client sends requests faster than an API allows, the server answers with status 429 Too Many Requests. A Retry-After header can state how many seconds the client should wait before trying again."
+        },
+        {
+          "candidate_id": "v2_en_zh_retry-c02",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_en_zh_retry-c03",
+          "language": "zh",
+          "text": "遇到 HTTP 429 时，客户端应降低请求速率，并在服务提供 Retry-After 时按其等待。指数退避和随机抖动可减少多个客户端同时重试造成的拥塞。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-e34029792601",
+      "query": "API key 放哪里才能避免进入 source control？",
+      "query_language": "mixed",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_mx_en_api-c01",
+          "language": "zh",
+          "text": "API token 属于秘密凭证，拿到它的人可能调用其授权范围内的接口。凭证应放在环境变量或秘密管理工具中；一旦泄露，应撤销并轮换，而不是只从最新代码中删除。"
+        },
+        {
+          "candidate_id": "v2_mx_en_api-c02",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_mx_en_api-c03",
+          "language": "en",
+          "text": "An API key is a bearer secret: anyone who obtains it may act with its permissions. Keep keys in environment configuration, restrict their scope, rotate exposed keys, and avoid putting them in logs or source control."
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-2dfca74cab25",
+      "query": "HTTP request timeout 后 retry POST 为什么有 duplicate 风险？",
+      "query_language": "mixed",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_mx_en_timeout-c01",
+          "language": "en",
+          "text": "When a long text is cut into pieces for retrieval, a sentence that sits exactly on a cut can end up split in two, with half of its meaning in each piece. Neither half may then match a question about it. To reduce this risk, the splitter copies the last part of each piece to the beginning of the following one. The copied region is usually a small fraction of the piece length, for example 200 characters for 1200-character pieces. The price is some duplicated storage and a few more vectors to compute."
+        },
+        {
+          "candidate_id": "v2_mx_en_timeout-c02",
+          "language": "en",
+          "text": "An HTTP timeout bounds how long a client waits for a connection or response. A timeout does not prove the server failed to process the request, so blindly retrying a non-idempotent POST can create duplicate effects."
+        },
+        {
+          "candidate_id": "v2_mx_en_timeout-c03",
+          "language": "mixed",
+          "text": "HTTP PUT 对已知 resource URI 通常是 idempotent，可以在确认条件后 retry；POST 可能创建 duplicate resource，timeout 后不代表服务端没有完成操作。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-3ba9f11e603a",
+      "query": "SQLite WAL 能不能让多个 writer 同时写入？",
+      "query_language": "mixed",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_mx_zh_wal-c01",
+          "language": "en",
+          "text": "A SQLite transaction groups related writes so they commit together or roll back together. Keep the transaction short; doing slow network work while holding a write transaction can block other writers."
+        },
+        {
+          "candidate_id": "v2_mx_zh_wal-c02",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        },
+        {
+          "candidate_id": "v2_mx_zh_wal-c03",
+          "language": "zh",
+          "text": "SQLite 的 WAL 模式让读者可以继续读取上一次已提交的数据，同时写入者把新内容追加到 WAL 文件。它仍然只允许一个写入者，因此 WAL 并不等于多个写入事务可以同时提交。"
+        }
+      ],
+      "judgments": []
+    },
+    {
+      "query_id": "review-8f382e98a352",
+      "query": "Python 里为什么不建议 catch Exception 然后 silent pass？",
+      "query_language": "mixed",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "candidate_id": "v2_mx_zh_python-c01",
+          "language": "zh",
+          "text": "API token 属于秘密凭证，拿到它的人可能调用其授权范围内的接口。凭证应放在环境变量或秘密管理工具中；一旦泄露，应撤销并轮换，而不是只从最新代码中删除。"
+        },
+        {
+          "candidate_id": "v2_mx_zh_python-c02",
+          "language": "zh",
+          "text": "Python 中应捕获能够处理的具体异常类型，并保留必要的上下文。捕获所有 Exception 后静默忽略会隐藏编程错误，让任务看似成功却丢失失败信息。"
+        },
+        {
+          "candidate_id": "v2_mx_zh_python-c03",
+          "language": "zh",
+          "text": "SQLite 把整个数据库保存在一个普通文件里，不需要单独安装或启动数据库服务器。应用程序通过函数库直接读写这个文件，备份时复制文件即可，因此很适合本地开发和小型项目。"
+        }
+      ],
+      "judgments": []
+    }
+  ]
+}

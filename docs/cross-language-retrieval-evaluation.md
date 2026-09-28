@@ -1,5 +1,8 @@
 # Cross-Language Retrieval Evaluation（Batch 6B）
 
+> Batch 6B is historical. Batch 6C dataset expansion, review status, safe-memory
+> preflight, and current decision are recorded at the end of this document.
+
 > **这是一个开发评估集上的受控对比，不是通用 benchmark。**
 > 所有结论都只针对这 42 个 chunk、33 个问题："On this evaluation set…"。
 > 一个问题就能让某个方向的 Recall 变化 0.2–1.0，跨语言组（10 个问题）一个问题 = 0.1。
@@ -241,3 +244,204 @@ length-1、同一文本两次得到相同向量、两次评估排名完全相同
 - BGE-M3 没有被实测（资源限制）；只比较了一个候选。
 - 只比较 dense retrieval；没有 reranking、hybrid search（本 Batch 明确不做）。
 - 计时来自一台负载较高的 Windows 笔记本，只是大致范围。
+
+---
+
+# Batch 6C — Retrieval Evaluation Expansion & BGE-M3 Measurement
+
+Batch 6C adds a frozen larger dataset and safe resource preflight. It does not
+change the production embedding model, stored vectors, search route, or chunking.
+The Batch 6A and 6B results above remain historical records for the original data.
+
+## Dataset Versions
+
+| Version | Passages | Queries | Chunks at 1200/200 | Status |
+|---|---:|---:|---:|---|
+| `retrieval_eval_v1` | 42 | 33 | 42 | Immutable Batch 6A/6B baseline |
+| `retrieval_eval_v2` | 78 | 70 | 78 | Batch 6C expansion; synthetic/project-authored content |
+
+The artifact SHA-256 is over canonical UTF-8 JSON, including version, passages,
+query text, language tags, target language, supporting evidence spans, secondary
+labels, and hard-negative assignments.
+
+| Version | SHA-256 |
+|---|---|
+| `retrieval_eval_v1` | `c5e2cc8dc6198facfd9c2e1c8ca2cd2337a2d86be659b373318d6bde57c3637a` |
+| `retrieval_eval_v2` | `6fe703fff36429dd468c48e8b4ba666c175d3ef0fd4d73ff13a6f18013dd9afe` |
+
+The v1 execution fingerprint used by Batch 6B remains `7b8a9e13b131e4042cc13f4d77aeb66a876a2f947900f066a97b97cb8ee921c7`.
+Dataset JSON files are committed under [app/evaluation/datasets](../app/evaluation/datasets/).
+Evaluation verifies both the artifact digest and the source records before it runs;
+existing artifacts cannot be overwritten by the maintainer helper unless `force=True`
+is explicitly supplied.
+
+The v2 corpus distribution is 30 English, 32 Chinese, and 16 mixed passages. Its
+queries are: en→en 13, zh→zh 20, zh→en 12, en→zh 12, mixed→en 5, mixed→zh 5,
+zh→mixed 1, en→mixed 1, and mixed→mixed 1. This yields 36 cross-language queries
+across all unlike-language directions, including 12 zh→en and 12 en→zh.
+
+At least one labeled hard negative is listed for each of the 37 newly added queries.
+These are plausible, nearby but incorrect passages. They remain non-relevant for
+the main binary Recall@K and MRR metrics; they are marked in per-query diagnostics
+when they appear in a model's top five.
+
+## Independent Relevance Review
+
+A blind review pack for the 37 newly added queries is available at
+[retrieval_eval_v2_blind_review.json](retrieval_eval_v2_blind_review.json). It
+contains only the query, candidate source passages, language tags, and review
+criteria. Query and candidate IDs are opaque and candidates are reordered; the pack contains
+no model names, scores, rankings, or relevance labels. The rubric is:
+
+- `RELEVANT`: directly supports the answer.
+- `PARTIALLY_RELEVANT`: related context but insufficient to answer.
+- `NOT_RELEVANT`: does not support the answer.
+
+Only `RELEVANT` counts as positive for the main binary Recall@K and MRR metrics.
+`PARTIALLY_RELEVANT` is retained for review notes and counts as not relevant in
+those primary metrics.
+
+The review workflow requires one judgment per candidate; a question explicitly
+marked ambiguous is removed from the accepted review set, and a non-ambiguous
+question with no relevant evidence is rejected rather than kept to inflate the set.
+
+The second pass reviewed all 37 new queries against the question and passages,
+without consulting model output. No relevance labels changed and no query was
+removed as ambiguous. The authoring assistant also performed this review, so it is
+a blinded self-review rather than independent human corroboration. There was one
+reviewer; agreement and formal inter-rater reliability are not measurable. The
+labels should remain provisional until a second person reviews the pack.
+
+## Expanded Retrieval Results
+
+E5-small was measured on v2. E5-base and BGE-M3 were skipped by the memory
+preflight, not marked as failed models.
+
+| Model | R@1 | R@3 | R@5 | MRR | Query hits @1 / @3 / @5 |
+|---|---:|---:|---:|---:|---|
+| E5-small | 0.343 | 0.529 | 0.586 | 0.471 | 24/70, 37/70, 41/70 |
+| E5-base | — | — | — | — | NOT MEASURED — insufficient safe memory |
+| BGE-M3 | — | — | — | — | NOT MEASURED — insufficient safe memory |
+
+The result rows, per-direction counts, truncation groups, checks, resource data,
+and complete cross-language top-five diagnostics are in the
+[expanded comparison report](retrieval_eval_v2_model_comparison.md).
+
+The v2 runner reports successful query counts beside each metric when models are
+measured. It uses the same passages, labels, 1200/200 chunking, exact SQLite/NumPy
+search, ranking, top-k, and evaluation functions for all candidates; only the
+model-required input prefixes vary.
+
+## Cross-Language Results
+
+| Group | Queries | R@1 | R@3 | R@5 | MRR | Hits @1 / @3 / @5 |
+|---|---:|---:|---:|---:|---:|---|
+| All unlike-language directions | 36 | 0.083 | 0.250 | 0.306 | 0.212 | 3/36, 9/36, 11/36 |
+| zh→en | 12 | 0.000 | 0.083 | 0.083 | 0.051 | 0/12, 1/12, 1/12 |
+| en→zh | 12 | 0.000 | 0.083 | 0.167 | 0.120 | 0/12, 1/12, 2/12 |
+
+The zh→en weakness remains visible with 12 queries, and en→zh also has no rank-1
+hits. E5-base was not measured on this expanded set, so its Batch 6B improvement
+cannot be confirmed here. The all-cross-language aggregate includes mixed and
+mixed-target directions and should not be compared as if it were the old
+zh→en/en→zh-only 10-query aggregate. The detailed per-query ranks and top-five
+languages/scores are in the linked report.
+
+## Truncation Results
+
+Token counts below use the cached tokenizer JSON from the exact production
+E5-small revision and include the `passage: ` prefix and special tokens. This is a
+tokenizer-only analysis; no embedding model was loaded.
+
+| Language | Truncated chunks | Total chunks |
+|---|---:|---:|
+| English | 0 | 30 |
+| Chinese | 5 | 32 |
+| Mixed | 0 | 16 |
+| Total | 5 | 78 |
+
+Relevant-evidence query groups are 60 not truncated, 5 truncated with evidence
+inside the readable prefix, and 5 with evidence beyond it. At E5-small's measured
+rankings, the group metrics were:
+
+| Evidence group | Queries | R@1 | R@3 | R@5 | MRR | Query hits @1 / @3 / @5 |
+|---|---:|---:|---:|---:|---:|---|
+| Not truncated | 60 | 0.350 | 0.550 | 0.600 | 0.479 | 21/60, 33/60, 36/60 |
+| Truncated, evidence inside window | 5 | 0.200 | 0.400 | 0.400 | 0.358 | 1/5, 2/5, 2/5 |
+| Truncated, evidence beyond window | 5 | 0.400 | 0.400 | 0.600 | 0.490 | 2/5, 2/5, 3/5 |
+
+These small groups do not establish that truncation improves retrieval. The
+outside-window group still missed relevant evidence for two of five queries at
+top five, while topic similarity sometimes ranked a truncated chunk. The five outside cases
+are four historical long Chinese answers (two other Chinese passages and two
+entries in the original FAQ) plus the new late FAQ answer about Docker volumes. The long v2
+FAQ is one 881-character chunk: 538 model-input tokens; evidence ends at token 35
+(beginning), 310 (middle), and 517 (end). Thus the last evidence sentence falls
+outside the 512-token production E5 window. E5-small's measured ranking for the
+query targeting that final answer is shown in the linked report; its result is
+one observation and does not establish the general retrieval impact of truncation.
+
+## BGE-M3 Measurement
+
+**NOT MEASURED — insufficient safe memory.** The pinned BGE-M3 cache is present
+and occupies approximately 2.13 GiB on disk. After E5-small completed, available
+physical memory was about 2.27 GiB and available commit about 2.86 GiB, below the
+4.25 GiB safe preflight requirement based on the prior ~3.4 GiB peak plus reserve.
+The process was not started and no BGE-M3 accuracy, latency, memory peak, or
+truncation result is claimed. The cache is Git-ignored and was left intact.
+
+## Resource Comparison
+
+E5-small measured 2.4 s model load, 7.9 s to embed 78 chunks, 41 ms mean query
+embedding plus search (169 ms maximum), 1.13 GiB peak working set, and 1.48 GiB
+peak private memory. Its cached model files occupied 465 MiB. E5-base and BGE-M3
+were skipped before model load: available RAM/commit after the E5-small run was
+2.27/2.86 GiB; their safe requirements were 2.85/4.25 GiB. The measurement setup
+was Python 3.13.7, FastEmbed 0.8.1, ONNX Runtime 1.30.0, CPU execution, and batch
+size 16 on the same 16 GB Intel i5-1334U Windows laptop. These are single-run
+values, not ranges. Earlier Batch 6A/6B measurements remain historical and are
+not represented as v2 results. The evaluator checks physical and commit headroom
+before each child, uses a 25% reserve over the prior peak, runs offline, and
+isolates each model in a fresh process. `--skip-bge` and `--only-bge` are supported.
+
+## Decision
+
+**MORE-DATA.** Keep production on E5-small. The new corpus raises cross-language
+coverage from the historical 10 cases to 36 and adds realistic long Chinese text.
+E5-small's expanded-set measurements still show weak cross-language retrieval;
+E5-base and BGE-M3 were not measured on v2, and the labels do not yet have
+independent human review. There is no evidence in this batch to justify migration
+or to conclude whether the E5-base improvement persists. Rerun the v2 comparison
+on a host with safe memory headroom and have a second reviewer adjudicate the blind
+pack. No production migration, embedding regeneration, or chunking change occurred.
+
+## Tests and Negative Testing
+
+| Suite | Count |
+|---|---:|
+| Existing tests before Batch 6C | 535 (517 passed, 18 opt-in skips) |
+| New Batch 6C tests | 39 |
+| Current total | 574 (556 passed, 18 opt-in skips) |
+
+The 15 requested negative scenarios were caught by temporary artifact/result
+mutations, resource preflight, or existing isolation and validation tests (15/15):
+gold query/passage/label/checksum changes; missing directions or cross-language
+queries; removed hard negatives; explicitly ambiguous review entries; production
+candidate mutation; forced BGE-M3 below its memory reserve; offline cache misses;
+changed prefix contract; altered relevance; changed ranking fingerprint; and
+different chunks across model results. Mutations used disposable test data/results;
+no repository source mutation was left behind. The ranking mutation was simulated
+at the evaluated-result fingerprint level.
+
+The new tests specifically cover dataset immutability and digests, language/query
+counts, evidence windows, review disposition, BGE selection and memory guard, and
+determinism. The 18 skips are existing opt-in real-model smoke/evaluation tests;
+the separate Batch 6C comparison did load E5-small after its safe-memory preflight.
+
+Run the versioned evaluation offline:
+
+```powershell
+.venv\Scripts\python.exe -m app.evaluation.compare_models --dataset-version retrieval_eval_v2
+.venv\Scripts\python.exe -m app.evaluation.compare_models --dataset-version retrieval_eval_v2 --skip-bge
+.venv\Scripts\python.exe -m app.evaluation.compare_models --dataset-version retrieval_eval_v2 --only-bge
+```

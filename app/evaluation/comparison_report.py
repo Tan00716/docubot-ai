@@ -21,9 +21,9 @@ from app.evaluation.comparison import (
     overall,
     truncation,
 )
-from app.evaluation.corpus import PASSAGES
-from app.evaluation.golden import DIRECTIONS, QUERIES
-from app.evaluation.metrics import MetricSummary
+from app.evaluation.golden import DIRECTIONS
+from app.evaluation.metrics import MetricSummary, QueryOutcome, summarize
+from app.evaluation.dataset_versions import verify_dataset
 
 MEGABYTE, GIGABYTE = 1024**2, 1024**3
 
@@ -55,6 +55,15 @@ def metric_row(summary: MetricSummary, baseline: MetricSummary | None) -> list[s
     return values + [signed(v) for v in deltas(summary, baseline).values()]
 
 
+def success_counts(result: ModelResult, predicate=lambda query: True) -> str:
+    selected = [query for query in result.queries if predicate(query)]
+    if not selected:
+        return "0/0, 0/0, 0/0"
+    return ", ".join(
+        f"{sum(any(rank is not None and rank <= k for rank in query.ranks) for query in selected)}"
+        f"/{len(selected)}" for k in (1, 3, 5))
+
+
 def models_section(results: Sequence[ModelResult], skipped: dict[str, str]) -> str:
     rows = []
     for result in results:
@@ -73,20 +82,25 @@ def models_section(results: Sequence[ModelResult], skipped: dict[str, str]) -> s
 
 def overall_section(results: Sequence[ModelResult]) -> str:
     baseline = overall(results[0])
-    rows = [[r.model_name, *metric_row(overall(r), None if r is results[0] else baseline)]
+    rows = [[r.model_name, *metric_row(overall(r), None if r is results[0] else baseline),
+             success_counts(r)]
             for r in results]
-    return table(["Model", *METRIC_NAMES, *(f"Δ {m}" for m in METRIC_NAMES)], rows)
+    return table(["Model", *METRIC_NAMES, *(f"Δ {m}" for m in METRIC_NAMES),
+                  "Query hits @1/@3/@5"], rows)
 
 
 def cross_section(results: Sequence[ModelResult]) -> str:
     baseline = cross_language(results[0])
     rows = [[r.model_name, cross_language(r).queries,
-             *metric_row(cross_language(r), None if r is results[0] else baseline)]
+             *metric_row(cross_language(r), None if r is results[0] else baseline),
+             success_counts(r, lambda q: _direction_is_cross(q.direction, r))]
             for r in results]
-    return ("Cross-language = " + " + ".join(CROSS_LANGUAGE_DIRECTIONS)
+    grouping = (" + ".join(CROSS_LANGUAGE_DIRECTIONS) if results[0].dataset_version == "retrieval_eval_v1"
+                else "all directions where query and target languages differ")
+    return ("Cross-language = " + grouping
             + " (each question counts once).\n\n"
             + table(["Model", "Queries", *(f"Cross {m}" for m in METRIC_NAMES),
-                     *(f"Δ {m}" for m in METRIC_NAMES)], rows))
+                     *(f"Δ {m}" for m in METRIC_NAMES), "Query hits @1/@3/@5"], rows))
 
 
 def direction_section(results: Sequence[ModelResult]) -> str:
@@ -97,8 +111,10 @@ def direction_section(results: Sequence[ModelResult]) -> str:
             summary = by_direction(result)[direction]
             base = None if result is results[0] else baseline[direction]
             values = metric_row(summary, base)
-            rows.append([direction, result.model_name, summary.queries, *values[:4], values[7]])
-    return table(["Direction", "Model", "Queries", *METRIC_NAMES, "Δ MRR"], rows)
+            hits = success_counts(result, lambda q: q.direction == direction)
+            rows.append([direction, result.model_name, summary.queries, *values[:4], values[7], hits])
+    return table(["Direction", "Model", "Queries", *METRIC_NAMES, "Δ MRR",
+                  "Query hits @1/@3/@5"], rows)
 
 
 def profile_section(results: Sequence[ModelResult]) -> str:
@@ -108,30 +124,45 @@ def profile_section(results: Sequence[ModelResult]) -> str:
         rows.append([result.model_name, p.queries, p.at_rank_1, p.in_top_3, p.in_top_5,
                      " ".join(str(rank or "-") for rank in p.first_ranks),
                      f"{p.query_language_in_top}/{p.top_slots}", p.truncated_evidence])
+    cross_ids = [query.query_id for query in results[0].queries
+                 if _direction_is_cross(query.direction, results[0])]
     return ("First relevant rank per cross-language question, in dataset order "
-            f"({', '.join(q.query_id for q in QUERIES if _is_cross(q.query_id, results[0]))}).\n\n"
+            f"({', '.join(cross_ids)}).\n\n"
             + table(["Model", "Queries", "Rank 1", "Top 3", "Top 5", "First relevant ranks",
                      "Top-5 results in the question's language", "Relevant chunk truncated"],
                     rows))
 
 
-def _is_cross(query_id: str, result: ModelResult) -> bool:
-    return any(q.query_id == query_id and q.direction in CROSS_LANGUAGE_DIRECTIONS
-               for q in result.queries)
+def _direction_is_cross(direction: str, result: ModelResult) -> bool:
+    if result.dataset_version == "retrieval_eval_v1":
+        return direction in CROSS_LANGUAGE_DIRECTIONS
+    return direction.split("->")[0] != direction.split("->")[1]
 
 
 def truncation_section(results: Sequence[ModelResult]) -> str:
     rows = []
+    query_rows = []
     for result in results:
         t = truncation(result)
         cells = [f"{t[k].truncated}/{t[k].chunks} ({t[k].percent:.0f}%)"
                  for k in ("en", "zh", "mixed", "total")]
         longest = max(c.tokens for c in result.chunks)
         rows.append([result.model_name, result.max_tokens, *cells, longest])
-    return ("The same 42 chunks (1200/200) for every model; a chunk is truncated when its "
+        for group in ("not truncated", "truncated, evidence inside window",
+                      "truncated, evidence beyond window"):
+            group_outcomes = [QueryOutcome(q.query_id, q.direction, q.ranks)
+                              for q in result.queries if q.truncation_group == group]
+            if group_outcomes:
+                summary = summarize(group_outcomes)
+                query_rows.append([result.model_name, group, summary.queries,
+                                   *(f"{summary.recall[k]:.3f}" for k in (1, 3, 5)),
+                                   f"{summary.mrr:.3f}"])
+    query_table = table(["Model", "Relevant evidence group", "Queries", "R@1", "R@3", "R@5", "MRR"], query_rows)
+    return (f"The same {len(results[0].chunks)} chunks (1200/200) for every model; a chunk is truncated when its "
             "model input (prefix included) has more tokens than the model reads.\n\n"
             + table(["Model", "Token limit", "English", "Chinese", "Mixed", "Total",
-                     "Longest chunk (tokens)"], rows))
+                     "Longest chunk (tokens)"], rows) + "\n\nQuery outcomes grouped by whether relevant evidence is model-readable:\n\n"
+            + query_table)
 
 
 def resources_section(results: Sequence[ModelResult], env: dict[str, str]) -> str:
@@ -145,13 +176,14 @@ def resources_section(results: Sequence[ModelResult], env: dict[str, str]) -> st
                      size(r["peak_working_set"]), size(r["peak_private_bytes"])])
     batch = results[0].resources["embedding_batch_size"]
     setup = "; ".join(f"{key} {value}" for key, value in env.items())
-    return (table(["Model", "Cold download", "Cache on disk", "Model load", "Embed 42 chunks",
+    return (table(["Model", "Cold download", "Cache on disk", "Model load",
+                   f"Embed {len(results[0].chunks)} chunks",
                    "Query embed + search (mean)", "Peak working set", "Peak private memory"],
                   rows)
             + f"\n\nSetup (identical for every model): {setup}; embedding batch size {batch} "
             "(the application default; every passage is its own document). Each model ran in "
-            "its own fresh process. Timings on this laptop vary noticeably between runs; read "
-            "them as rough ranges, not exact values.")
+            "its own fresh process. Timings are single-run measurements on this laptop; treat "
+            "them as rough indications, not benchmarks.")
 
 
 def checks_section(results: Sequence[ModelResult]) -> str:
@@ -162,20 +194,22 @@ def checks_section(results: Sequence[ModelResult]) -> str:
 
 
 def diagnostics_section(results: Sequence[ModelResult]) -> str:
-    text_of = {q.query_id: q for q in QUERIES}
-    language_of = {p.key: p.language for p in PASSAGES}
+    dataset = verify_dataset(results[0].dataset_version)
+    text_of = {q.query_id: q for q in dataset.queries}
+    language_of = {p.key: p.language for p in dataset.passages}
     parts = []
     for result in results:
         passage_of = {c.chunk_id: c.passage_key for c in result.chunks}
         rows = []
         for query in result.queries:
-            if query.direction not in CROSS_LANGUAGE_DIRECTIONS:
+            if not _direction_is_cross(query.direction, result):
                 continue
             golden = text_of[query.query_id]
             evidence = "; ".join(f"{e.passage_key}: \"{e.text}\"" for e in golden.relevant)
             top = "<br>".join(
                 f"{'**' if hit.relevant else ''}{hit.language} {passage_of[hit.chunk_id]} "
                 f"`{hit.chunk_id[:8]}…{hit.chunk_id[-5:]}` {hit.score:.4f}"
+                f"{' [HARD NEGATIVE]' if hit.hard_negative else ''}"
                 f"{'**' if hit.relevant else ''}" for hit in query.top)
             target = language_of[golden.relevant[0].passage_key]
             rows.append([query.query_id, golden.text, f"{query.query_language}→{target}",
@@ -188,6 +222,7 @@ def diagnostics_section(results: Sequence[ModelResult]) -> str:
 
 def render(results: Sequence[ModelResult], skipped: dict[str, str], env: dict[str, str],
            seconds: float) -> str:
+    dataset = verify_dataset(results[0].dataset_version)
     sections = [
         ("Models", models_section(results, skipped)),
         ("Overall", overall_section(results)),
@@ -199,8 +234,10 @@ def render(results: Sequence[ModelResult], skipped: dict[str, str], env: dict[st
         ("Vector and input contract checks (real runs)", checks_section(results)),
         ("Per-query cross-language diagnostics", diagnostics_section(results)),
     ]
-    head = ("# DocuBot embedding model comparison (Batch 6B)\n\n"
-            "A development evaluation set (42 chunks, 33 questions), not a general benchmark. "
+    batch = "Batch 6B" if dataset.version == "retrieval_eval_v1" else "Batch 6C"
+    head = (f"# DocuBot embedding model comparison ({batch})\n\n"
+            f"A development evaluation set ({len(results[0].chunks)} chunks, {len(dataset.queries)} questions; "
+            f"{dataset.version}, SHA-256 {dataset.sha256}), not a general benchmark. "
             "Only the embedding model changes; chunking 1200/200, exact search, ranking, "
             "top_k and labels are the Batch 6A ones. Deltas are candidate minus "
             f"{results[0].model_name}. One question changes a direction's Recall by 0.2-1.0. "

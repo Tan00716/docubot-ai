@@ -49,6 +49,7 @@ Production-oriented RAG Telegram knowledge assistant
 - A development evaluation set: 42 passages (English, Chinese, mixed), 33 questions with evidence-based labels
 - Recall@1/3/5 and MRR per language direction, truncation analysis, chunk-size experiment ([Retrieval Evaluation](#retrieval-evaluation))
 - Offline, evaluation-only embedding model comparison (E5-small vs. E5-base vs. BGE-M3) on the frozen dataset ([Cross-Language Retrieval Evaluation](#cross-language-retrieval-evaluation))
+- Batch 6C versioned expansion: 78 synthetic passages / 70 queries; model comparison is skipped when safe memory headroom is unavailable ([Batch 6C report](docs/cross-language-retrieval-evaluation.md#batch-6c--retrieval-evaluation-expansion--bge-m3-measurement))
 
 The Telegram bot and the web API are two **separate programs**. They are not
 connected to each other yet.
@@ -1207,6 +1208,11 @@ $env:DOCUBOT_RUN_MODEL_SMOKE_TEST = "1"
 | **不是的结论** | 这不是"1200 是最优值"的证明；只是现有证据不足以支持修改。 |
 
 ### Cross-Language Retrieval Evaluation
+
+> The table and analysis below are the historical Batch 6B run on the frozen
+> 42-chunk / 33-query `retrieval_eval_v1`. The expanded Batch 6C dataset is
+> `retrieval_eval_v2` (78 passages / 70 queries); its models were not loaded
+> when current safe memory headroom was insufficient. See the [Batch 6C report](docs/cross-language-retrieval-evaluation.md#batch-6c--retrieval-evaluation-expansion--bge-m3-measurement).
 
 > Batch 6B：**只换 embedding model** 的受控对比（数据集、chunking 1200/200、exact search、排序、`top_k`、
 > 标签全部不变）。开发评估集，不是 benchmark。完整结果、model contract、资源测量和 decision record 见
