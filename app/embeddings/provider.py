@@ -12,7 +12,9 @@ local files. Embedding itself always runs locally: no hosted API is called.
 
 Input contract (E5 models): the model must be told what kind of text it is
 reading. Document chunks are embedded as "passage: <text>" and questions as
-"query: <text>". The prefix is added here, at embedding time only.
+"query: <text>". The prefix is added here, at embedding time only. The
+prefixes come from the model spec, never from this module: a model trained
+without prefixes (the evaluation candidate BGE-M3) has empty ones.
 """
 
 import json
@@ -56,7 +58,7 @@ TOKENIZER_AND_CONFIG_FILES = (
     "special_tokens_map.json",
 )
 
-POOLING_TYPES = {"mean": PoolingType.MEAN}
+POOLING_TYPES = {"mean": PoolingType.MEAN, "cls": PoolingType.CLS}
 
 # Models that this process has registered with FastEmbed, with the spec used
 # (see _register_model). FastEmbed cannot re-register a name, so a changed
@@ -76,9 +78,18 @@ class EmbeddingProvider(Protocol):
     def embed_query(self, text: str) -> tuple[float, ...]: ...
 
 
-def build_contract(config: EmbeddingConfig) -> EmbeddingContract:
-    """The contract for a config (no download). Unknown models are rejected."""
-    spec = get_model_spec(config.model_name)
+def build_contract(config: EmbeddingConfig,
+                   spec: EmbeddingModelSpec | None = None) -> EmbeddingContract:
+    """The contract for a config (no download). Unknown models are rejected.
+
+    spec is only given by the offline model comparison (app/evaluation/),
+    for candidate models that the application itself cannot be configured
+    with; it must describe config.model_name.
+    """
+    if spec is None:
+        spec = get_model_spec(config.model_name)
+    elif spec.name != config.model_name:
+        raise UnsupportedEmbeddingModelError()
     return EmbeddingContract(
         model_name=spec.name,
         model_revision=spec.revision,
@@ -93,7 +104,8 @@ def build_contract(config: EmbeddingConfig) -> EmbeddingContract:
 
 
 def model_files(spec: EmbeddingModelSpec) -> list[str]:
-    return [*TOKENIZER_AND_CONFIG_FILES, spec.model_file]
+    return [*TOKENIZER_AND_CONFIG_FILES, spec.model_file, *spec.external_data_files,
+            *spec.metadata_files]
 
 
 def download_model_files(spec: EmbeddingModelSpec, cache_dir: Path) -> Path:
@@ -182,10 +194,11 @@ def _check_texts(texts: Sequence[str]) -> None:
 class FastEmbedProvider:
     """One real local provider. One instance = one loaded model, reused."""
 
-    def __init__(self, config: EmbeddingConfig):
+    def __init__(self, config: EmbeddingConfig, spec: EmbeddingModelSpec | None = None):
+        """spec: see build_contract(). The application never passes it."""
         self.config = config
-        self.spec = get_model_spec(config.model_name)
-        self.contract = build_contract(config)
+        self.contract = build_contract(config, spec)
+        self.spec = spec if spec is not None else get_model_spec(config.model_name)
         self._model: TextEmbedding | None = None
         self._counting_tokenizer: Tokenizer | None = None  # see count_tokens()
         self._load_lock = threading.Lock()  # two requests must not load it twice

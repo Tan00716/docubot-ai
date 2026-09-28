@@ -48,6 +48,7 @@ Production-oriented RAG Telegram knowledge assistant
 
 - A development evaluation set: 42 passages (English, Chinese, mixed), 33 questions with evidence-based labels
 - Recall@1/3/5 and MRR per language direction, truncation analysis, chunk-size experiment ([Retrieval Evaluation](#retrieval-evaluation))
+- Offline, evaluation-only embedding model comparison (E5-small vs. E5-base vs. BGE-M3) on the frozen dataset ([Cross-Language Retrieval Evaluation](#cross-language-retrieval-evaluation))
 
 The Telegram bot and the web API are two **separate programs**. They are not
 connected to each other yet.
@@ -1205,6 +1206,30 @@ $env:DOCUBOT_RUN_MODEL_SMOKE_TEST = "1"
 | **以后可能的方向** | 按 token 而不是字符限制 chunk 大小，或者按语言设置不同的 chunk size（选项 C）——需要先用**更多长中文文档**评估（选项 D），证明它确实有帮助。 |
 | **不是的结论** | 这不是"1200 是最优值"的证明；只是现有证据不足以支持修改。 |
 
+### Cross-Language Retrieval Evaluation
+
+> Batch 6B：**只换 embedding model** 的受控对比（数据集、chunking 1200/200、exact search、排序、`top_k`、
+> 标签全部不变）。开发评估集，不是 benchmark。完整结果、model contract、资源测量和 decision record 见
+> [docs/cross-language-retrieval-evaluation.md](docs/cross-language-retrieval-evaluation.md)。
+
+| Model | Overall R@5 | Overall MRR | Cross R@5（zh→en + en→zh） | Cross MRR | 中文 chunk 截断 | Peak memory | Query + search |
+|---|---|---|---|---|---|---|---|
+| `multilingual-e5-small`（生产） | 0.667 | 0.555 | 0.100 | 0.079 | 4/18 | 1.67 GB | 35–42 ms |
+| `multilingual-e5-base`（候选 A） | 0.758 | 0.639 | 0.400 | 0.254 | 4/18 | 2.28 GB | 76–89 ms |
+| `BAAI/bge-m3`（候选 B） | 跳过：实测资源限制（估计 peak ≈ 3.4 GB > 可用 RAM 2.3 GB） | | | | | | |
+
+- E5-small 的跨语言弱点**可复现**（与 Batch 6A 完全相同）。
+- E5-base 的提升主要在 en→zh（MRR 0.108 → 0.407）；zh→en 仍然很弱（R@5 0.0 → 0.2），6/10 个跨语言问题仍不在前 5；
+  截断完全不变（同一 tokenizer、同一 512 上限）；成本约 2 倍。
+- **Decision：MORE-DATA** —— 暂时保留 `multilingual-e5-small`，先扩充跨语言评估数据并完成 BGE-M3 测量。
+  候选模型只在 [app/evaluation/candidates.py](app/evaluation/candidates.py) 的 allowlist 里，应用无法使用它们；
+  生产迁移如果以后需要，必须是单独的 Batch。
+
+```powershell
+.venv\Scripts\python.exe -m app.evaluation.download_candidates e5-base   # 显式下载（唯一联网的一步）
+.venv\Scripts\python.exe -m app.evaluation.compare_models               # 离线对比
+```
+
 ### Current limitations
 
 - **Brute force O(N × D)**，每次搜索读取全部候选；适合小规模，不适合大规模。
@@ -1214,7 +1239,8 @@ $env:DOCUBOT_RUN_MODEL_SMOKE_TEST = "1"
   所以这类 chunk 的检索质量可能受影响（结果里 `truncated: true`）。本 batch 没有修改 chunk_size /
   chunk_overlap / chunk ID；以后通过检索评估和 chunking 策略再研究。
 - 超过 512 tokens 的问题会被拒绝（`422`），不再被悄悄截断（见 [Query token limit](#query-token-limit问题长度上限)）。
-- 在开发评估集上，跨语言检索明显弱于同语言检索（见 [Retrieval Evaluation](#retrieval-evaluation)）。
+- 在开发评估集上，跨语言检索明显弱于同语言检索（见 [Retrieval Evaluation](#retrieval-evaluation)）；
+  换成更大的 E5-base 只部分改善（见 [Cross-Language Retrieval Evaluation](#cross-language-retrieval-evaluation)）。
 - **No reranking, no hybrid search**（没有 BM25 / 关键词检索），没有 metadata filter（只有 `document_id`）。
 - **No vector database / vector index**。
 - **No RAG answer generation**：搜索只返回相关的 chunk，不生成答案，也不生成引用。

@@ -31,6 +31,12 @@ class EmbeddingModelSpec:
     passage_prefix: str  # put in front of every document chunk before embedding
     query_prefix: str  # put in front of every search question before embedding
     license: str
+    # Extra ONNX weight files that model_file loads from its own folder. Large
+    # models keep their weights outside the .onnx file ("external data").
+    external_data_files: tuple[str, ...] = ()
+    # Official JSON files that are only READ to double-check this spec (e.g.
+    # 1_Pooling/config.json). They are never executed.
+    metadata_files: tuple[str, ...] = ()
 
 
 # The project's current embedding model: a development baseline, not a final
